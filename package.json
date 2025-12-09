@@ -1,0 +1,17 @@
+{
+  "name": "victorsharp-labs-proxy",
+  "version": "1.0.0",
+  "description": "Minimal Google Labs (Veo) proxy server for Victor Sharp FlowMotions, designed to run on Render.com (US region).",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.0",
+    "cors": "^2.8.5"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
