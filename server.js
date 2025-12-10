@@ -1,84 +1,90 @@
-// server.js  – VictorSharp Labs Proxy v3
-import express from "express";
-import fetch from "node-fetch";
+// server.js – VictorSharp Labs Proxy v3 (no node-fetch)
+
+const express = require("express");
+const cors = require("cors");
 
 const app = express();
-
-// Đọc body JSON từ desktop
-app.use(express.json({ limit: "2mb" }));
-
 const PORT = process.env.PORT || 10000;
 
-// Endpoint chính của Veo 3.1 fast trên Labs
-const LABS_ENDPOINT =
-  "https://labs.google/aisandbox/v1/projects/764086051850/locations/us-central1/publishers/google/models/veo-3.1-fast-generate-001:predictLongRunning";
+// ====== MIDDLEWARE ======
+app.use(cors());
+app.use(express.json());
 
-// Helper: lấy token từ header
+// Root check
+app.get("/", (_req, res) => {
+  res.send("VictorSharp Labs Proxy is running.");
+});
+
+// Helper: lấy token từ header (Authorization hoặc x-labs-token)
 function extractLabsToken(req) {
-  // Desktop v3 gửi ở đây
-  const xHeader = req.headers["x-labs-token"];
-  if (xHeader && typeof xHeader === "string") return xHeader.trim();
+  const authHeader = req.headers["authorization"];
+  const labsHeader = req.headers["x-labs-token"];
 
-  // Phòng trường hợp app khác gửi kiểu Authorization: Bearer ya29...
-  const auth = req.headers["authorization"];
-  if (auth && typeof auth === "string") {
-    if (auth.toLowerCase().startsWith("bearer ")) {
-      return auth.slice(7).trim();
+  // Ưu tiên Authorization: Bearer ya29...
+  if (authHeader && typeof authHeader === "string") {
+    if (authHeader.startsWith("Bearer ")) {
+      return authHeader.substring("Bearer ".length).trim();
     }
+    return authHeader.trim();
+  }
+
+  // Nếu Desktop gửi x-labs-token thì dùng luôn
+  if (labsHeader && typeof labsHeader === "string") {
+    return labsHeader.trim();
   }
 
   return null;
 }
 
-// Test route
-app.get("/", (_req, res) => {
-  res.send("VictorSharp Labs Proxy v3 is running.");
-});
-
-// Route desktop sẽ gọi
+// ====== MAIN ROUTE ======
 app.post("/labs/generate", async (req, res) => {
+  console.log("[PROXY] Incoming /labs/generate");
+
+  const token = extractLabsToken(req);
+
+  if (!token) {
+    console.warn("[PROXY] Missing Labs token in headers");
+    return res.status(400).json({
+      error: "Missing Authorization header (Bearer ya29... token)",
+    });
+  }
+
+  const targetUrl =
+    "https://labs.google/aisandbox/v1/projects/764086051850/locations/us-central1/publishers/google/models/veo-3.1-fast-generate-001:predictLongRunning";
+
   try {
-    const labsToken = extractLabsToken(req);
+    console.log("[PROXY] Forwarding to Labs:", targetUrl);
 
-    if (!labsToken) {
-      return res.status(400).json({
-        error:
-          'Missing Labs token. Send header "x-labs-token: ya29..." or "Authorization: Bearer ya29..."',
-      });
-    }
-
-    console.log(">> [Proxy] Forwarding to Google Labs /veo-3.1-fast-generate-001");
-    console.log("   Body keys:", Object.keys(req.body || {}));
-
-    const response = await fetch(LABS_ENDPOINT, {
+    // Dùng global fetch của Node (>=18), không cần node-fetch
+    const upstream = await fetch(targetUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${labsToken}`,
+        Authorization: `Bearer ${token}`,
       },
       body: JSON.stringify(req.body || {}),
     });
 
-    const text = await response.text();
-    let data;
-    try {
-      data = JSON.parse(text);
-    } catch {
-      data = { raw: text };
-    }
+    const text = await upstream.text();
+    const status = upstream.status;
+    const contentType =
+      upstream.headers.get("content-type") || "application/json";
 
-    console.log("<< [Proxy] Google status:", response.status);
+    console.log("[PROXY] Labs response status:", status);
 
-    res.status(response.status).json(data);
+    res.status(status);
+    res.set("Content-Type", contentType);
+    res.send(text);
   } catch (err) {
-    console.error("!! [Proxy] Unexpected error:", err);
+    console.error("[PROXY] Error calling Labs:", err);
     res.status(500).json({
-      error: "Proxy internal error",
-      details: err?.message || String(err),
+      error: "proxy_error",
+      message: err.message || String(err),
     });
   }
 });
 
+// ====== START SERVER ======
 app.listen(PORT, () => {
-  console.log(`VictorSharp Labs Proxy v3 listening on port ${PORT}`);
+  console.log(`VictorSharp Labs Proxy listening on port ${PORT}`);
 });
