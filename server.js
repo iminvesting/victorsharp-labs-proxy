@@ -1,82 +1,98 @@
-// server.js - VictorSharp Labs Proxy v3 (Labs → Veo 3.1)
+// server.js – VictorSharp Labs Proxy v3 (Labs → Render VEO)
+// Simple Express proxy that accepts POST /labs/generate from desktop
+// and forwards to Google Labs VEO endpoint with the Labs session token.
 
 import express from "express";
 import cors from "cors";
+import fetch from "node-fetch";
 
 const app = express();
 const PORT = process.env.PORT || 10000;
 
 // ===== MIDDLEWARE =====
 app.use(cors());
-app.use(express.json({ limit: "5mb" }));
+app.use(express.json({ limit: "2mb" }));
 
 // Root check
 app.get("/", (_req, res) => {
   res.send("VictorSharp Labs Proxy is running.");
 });
 
-// Helper: lấy Labs token từ header (Authorization: Bearer ya29... hoặc x-labs-token)
+// Helper: lấy token từ header (Authorization: Bearer ya29...)
+// Desktop sẽ gửi token trong header x-labs-token, ta chuyển thành Authorization.
 function extractLabsToken(req) {
-  // Desktop gửi lên qua header x-labs-token
-  const header = req.headers["x-labs-token"];
-  if (!header || typeof header !== "string") return null;
-
-  // thường là chuỗi "ya29...."
-  if (header.startsWith("ya29.")) return header;
-
-  // nếu sau này gửi kiểu "Bearer ya29..." thì vẫn tách được
-  const parts = header.split(" ");
-  return parts[parts.length - 1];
+  const labsHeader = req.headers["x-labs-token"];
+  if (!labsHeader || typeof labsHeader !== "string") return null;
+  if (!labsHeader.startsWith("ya29.")) return null;
+  return labsHeader;
 }
 
-// URL VEO 3.1 trên Google Labs (HOST ĐẦY ĐỦ)
-const LABS_VEO_ENDPOINT =
-  "https://labs.google/aisandbox/v1/projects/764086051850/locations/us-central1/publishers/google/models/veo-3.1-fast-generate-001:predictLongRunning";
-
-// ===== MAIN PROXY ROUTE =====
+// Main endpoint: Desktop → Proxy
+// body: { prompt: string }
 app.post("/labs/generate", async (req, res) => {
-  const labsToken = extractLabsToken(req);
-
-  if (!labsToken) {
-    return res
-      .status(400)
-      .json({ error: "Missing x-labs-token header (Bearer ya29... token)" });
-  }
-
   try {
-    // Forward body + token sang Google Labs
-    const upstream = await fetch(LABS_VEO_ENDPOINT, {
+    const token = extractLabsToken(req);
+    if (!token) {
+      return res.status(400).json({
+        error: "Missing x-labs-token header (ya29... token)",
+      });
+    }
+
+    const prompt = req.body?.prompt || "";
+    if (!prompt) {
+      return res.status(400).json({ error: "Missing prompt in body" });
+    }
+
+    // Google Labs VEO endpoint (long-running)
+    const labsUrl =
+      "https://labs.google/aisandbox/v1/projects/764086051850/locations/us-central1/publishers/google/models/veo-3.1-fast-generate-001:predictLongRunning";
+
+    const payload = {
+      // Very small demo payload – desktop có thể mở rộng thêm nếu cần
+      input: {
+        text: prompt,
+      },
+      config: {
+        // just placeholders; real config can be passed from desktop later
+        duration_seconds: 4,
+        aspect_ratio: "16:9",
+      },
+    };
+
+    console.log("[PROXY] Forwarding to Labs VEO…");
+
+    const labsResp = await fetch(labsUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${labsToken}`,
+        Authorization: `Bearer ${token}`,
       },
-      body: JSON.stringify(req.body),
+      body: JSON.stringify(payload),
     });
 
-    const text = await upstream.text();
-    res.status(upstream.status);
-
-    // cố gắng parse JSON, nếu fail thì trả raw text
+    const rawText = await labsResp.text();
+    let json;
     try {
-      const json = JSON.parse(text);
-      return res.json(json);
-    } catch {
-      return res.send(text);
+      json = JSON.parse(rawText);
+    } catch (e) {
+      json = { raw: rawText };
     }
+
+    if (!labsResp.ok) {
+      console.error("[PROXY] Labs error", labsResp.status, json);
+      return res.status(labsResp.status).json(json);
+    }
+
+    return res.json(json);
   } catch (err) {
-    console.error("[Proxy] Error calling Labs:", err);
-    res.status(500).json({
-      error: "Proxy error calling Labs",
-      detail: String(err),
-    });
+    console.error("[PROXY] Unexpected error:", err);
+    return res.status(500).json({ error: "Proxy internal error" });
   }
 });
 
 // Start server
 app.listen(PORT, () => {
-  console.log(`VictorSharp Labs Proxy listening on port ${PORT}`);
-  console.log(`Forwarding to: ${LABS_VEO_ENDPOINT}`);
+  console.log("VictorSharp Labs Proxy listening on port", PORT);
+  console.log("Your service is live ✨");
+  console.log("////////////////////////////////////////////////////////");
 });
-
-export default app;
