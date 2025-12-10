@@ -1,4 +1,4 @@
-// server.js – VictorSharp Labs Proxy v3 (no node-fetch)
+// server.js – VictorSharp Labs Proxy v3 (CommonJS)
 
 const express = require("express");
 const cors = require("cors");
@@ -6,85 +6,74 @@ const cors = require("cors");
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-// ====== MIDDLEWARE ======
+// ===== MIDDLEWARE =====
 app.use(cors());
 app.use(express.json());
+
+// URL Veo fast-generate (Labs sandbox)
+const TARGET_URL =
+  "https://labs.google/aisandbox/v1/projects/764086051850/locations/us-central1/publishers/google/models/veo-3.1-fast-generate-001:predictLongRunning";
+
+// Helper: lấy token từ header (Authorization hoặc x-labs-token)
+function extractLabsToken(req) {
+  // Desktop gửi trong header x-labs-token
+  let token = req.headers["x-labs-token"];
+
+  // fallback: nếu sau này mình gửi dạng Authorization: Bearer ya29...
+  if (!token && req.headers["authorization"]) {
+    const auth = req.headers["authorization"];
+    if (auth.toLowerCase().startsWith("bearer ")) {
+      token = auth.slice(7).trim();
+    }
+  }
+
+  return token;
+}
 
 // Root check
 app.get("/", (_req, res) => {
   res.send("VictorSharp Labs Proxy is running.");
 });
 
-// Helper: lấy token từ header (Authorization hoặc x-labs-token)
-function extractLabsToken(req) {
-  const authHeader = req.headers["authorization"];
-  const labsHeader = req.headers["x-labs-token"];
-
-  // Ưu tiên Authorization: Bearer ya29...
-  if (authHeader && typeof authHeader === "string") {
-    if (authHeader.startsWith("Bearer ")) {
-      return authHeader.substring("Bearer ".length).trim();
-    }
-    return authHeader.trim();
-  }
-
-  // Nếu Desktop gửi x-labs-token thì dùng luôn
-  if (labsHeader && typeof labsHeader === "string") {
-    return labsHeader.trim();
-  }
-
-  return null;
-}
-
-// ====== MAIN ROUTE ======
+// Endpoint Desktop sẽ gọi
 app.post("/labs/generate", async (req, res) => {
-  console.log("[PROXY] Incoming /labs/generate");
-
-  const token = extractLabsToken(req);
-
-  if (!token) {
-    console.warn("[PROXY] Missing Labs token in headers");
-    return res.status(400).json({
-      error: "Missing Authorization header (Bearer ya29... token)",
-    });
-  }
-
-  const targetUrl =
-    "https://labs.google/aisandbox/v1/projects/764086051850/locations/us-central1/publishers/google/models/veo-3.1-fast-generate-001:predictLongRunning";
-
   try {
-    console.log("[PROXY] Forwarding to Labs:", targetUrl);
+    const labsToken = extractLabsToken(req);
 
-    // Dùng global fetch của Node (>=18), không cần node-fetch
-    const upstream = await fetch(targetUrl, {
+    if (!labsToken) {
+      return res.status(400).json({
+        error: "Missing Authorization header (Bearer ya29... token)",
+      });
+    }
+
+    // Gửi request sang Google Labs
+    const upstreamResponse = await fetch(TARGET_URL, {
       method: "POST",
       headers: {
+        Authorization: `Bearer ${labsToken}`,
         "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
       },
       body: JSON.stringify(req.body || {}),
     });
 
-    const text = await upstream.text();
-    const status = upstream.status;
-    const contentType =
-      upstream.headers.get("content-type") || "application/json";
+    const text = await upstreamResponse.text();
+    let json;
 
-    console.log("[PROXY] Labs response status:", status);
+    try {
+      json = JSON.parse(text);
+    } catch (e) {
+      json = { raw: text };
+    }
 
-    res.status(status);
-    res.set("Content-Type", contentType);
-    res.send(text);
+    res.status(upstreamResponse.status).json(json);
   } catch (err) {
-    console.error("[PROXY] Error calling Labs:", err);
-    res.status(500).json({
-      error: "proxy_error",
-      message: err.message || String(err),
-    });
+    console.error("[PROXY] Error:", err);
+    res.status(500).json({ error: "Proxy error", details: String(err) });
   }
 });
 
-// ====== START SERVER ======
+// Start server
 app.listen(PORT, () => {
   console.log(`VictorSharp Labs Proxy listening on port ${PORT}`);
+  console.log(`Forwarding to: ${TARGET_URL}`);
 });
