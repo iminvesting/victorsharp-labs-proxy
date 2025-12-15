@@ -1,12 +1,20 @@
-# VictorSharp Labs Proxy – Render Package
+# VictorSharp Flow Veo3 Backend Proxy (Render)
 
-Proxy này dùng để chạy trên **Render.com (US)**, giúp Victor Sharp FlowMotions gọi được
-Google Labs VideoFX (Veo 3.x) **mà không cần VPN trên máy cá nhân**.
+Backend proxy **public HTTPS** cho **VictorSharp Web App (AI Studio Preview / Web App)** sử dụng **Flow Veo3**.
 
-Kiến trúc:
+---
 
-Desktop App (VN IP) → Render Proxy (US IP) → Google Labs (Veo 3.x)
+## 🎯 Mục đích
 
-Google chỉ thấy IP US của Render nên không chặn region nữa.
+- Web App **KHÔNG gọi trực tiếp** Google Flow Veo3 (do CORS + bảo mật).
+- Backend Proxy chịu trách nhiệm:
+  - Nhận request từ Web App
+  - Inject **Authorization: Bearer access_token**
+  - Forward request sang **Google Labs / Flow Veo3**
+  - Xử lý **jobId + polling status**
+- Cho phép Web App chạy ổn định trên **AI Studio Preview / Web hosting**.
 
-Xem thêm file README_FULL_GUIDE.md ở folder gốc package để có quy trình tổng thể.
+---
+
+## 🧱 Kiến trúc hệ thống
+
