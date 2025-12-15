@@ -1,6 +1,7 @@
-// server.js – VictorSharp Labs Proxy v3 (Labs → Render VEO)
-// Simple Express proxy that accepts POST /labs/generate from desktop
-// and forwards to Google Labs VEO endpoint with the Labs session token.
+// server.js – VictorSharp Flow Veo3 Backend Proxy (Render)
+// Dùng cho Web App (AI Studio Preview / Web)
+// KHÔNG dùng x-labs-token
+// Dùng Authorization: Bearer <access_token>
 
 import express from "express";
 import cors from "cors";
@@ -9,90 +10,105 @@ import fetch from "node-fetch";
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-// ===== MIDDLEWARE =====
+/* =======================
+   Middleware
+======================= */
 app.use(cors());
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "10mb" }));
 
-// Root check
+/* =======================
+   Health Check
+======================= */
 app.get("/", (_req, res) => {
-  res.send("VictorSharp Labs Proxy is running.");
+  res.json({ ok: true, service: "VictorSharp Flow Veo3 Proxy" });
 });
 
-// Helper: lấy token từ header (Authorization: Bearer ya29...)
-// Desktop sẽ gửi token trong header x-labs-token, ta chuyển thành Authorization.
-function extractLabsToken(req) {
-  const labsHeader = req.headers["x-labs-token"];
-  if (!labsHeader || typeof labsHeader !== "string") return null;
-  if (!labsHeader.startsWith("ya29.")) return null;
-  return labsHeader;
+/* =======================
+   Helper: Bearer Token
+======================= */
+function getBearerToken(req) {
+  const auth = req.headers.authorization;
+  if (!auth || !auth.startsWith("Bearer ")) return null;
+  return auth.replace("Bearer ", "");
 }
 
-// Main endpoint: Desktop → Proxy
-// body: { prompt: string }
-app.post("/labs/generate", async (req, res) => {
+/* =======================
+   Validate Session
+======================= */
+app.post("/api/flow/session/validate", async (req, res) => {
+  const token = getBearerToken(req);
+  if (!token) {
+    return res.status(401).json({ error: "Missing Authorization Bearer token" });
+  }
+  // Token hợp lệ hay không sẽ do Flow kiểm tra ở bước generate
+  return res.json({ ok: true });
+});
+
+/* =======================
+   Generate Video (Veo3)
+======================= */
+app.post("/api/flow/veo/generate", async (req, res) => {
+  const token = getBearerToken(req);
+  if (!token) {
+    return res.status(401).json({ error: "Missing Authorization Bearer token" });
+  }
+
+  const payload = req.body;
+  if (!payload) {
+    return res.status(400).json({ error: "Missing request body" });
+  }
+
   try {
-    const token = extractLabsToken(req);
-    if (!token) {
-      return res.status(400).json({
-        error: "Missing x-labs-token header (ya29... token)",
-      });
-    }
+    const resp = await fetch(
+      "https://labs.google/fx/api/veo/generate",
+      {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${token}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(payload)
+      }
+    );
 
-    const prompt = req.body?.prompt || "";
-    if (!prompt) {
-      return res.status(400).json({ error: "Missing prompt in body" });
-    }
-
-    // Google Labs VEO endpoint (long-running)
-    const labsUrl =
-      "https://labs.google/aisandbox/v1/projects/764086051850/locations/us-central1/publishers/google/models/veo-3.1-fast-generate-001:predictLongRunning";
-
-    const payload = {
-      // Very small demo payload – desktop có thể mở rộng thêm nếu cần
-      input: {
-        text: prompt,
-      },
-      config: {
-        // just placeholders; real config can be passed from desktop later
-        duration_seconds: 4,
-        aspect_ratio: "16:9",
-      },
-    };
-
-    console.log("[PROXY] Forwarding to Labs VEO…");
-
-    const labsResp = await fetch(labsUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
-      },
-      body: JSON.stringify(payload),
-    });
-
-    const rawText = await labsResp.text();
-    let json;
-    try {
-      json = JSON.parse(rawText);
-    } catch (e) {
-      json = { raw: rawText };
-    }
-
-    if (!labsResp.ok) {
-      console.error("[PROXY] Labs error", labsResp.status, json);
-      return res.status(labsResp.status).json(json);
-    }
-
-    return res.json(json);
+    const data = await resp.json();
+    return res.status(resp.status).json(data);
   } catch (err) {
-    console.error("[PROXY] Unexpected error:", err);
-    return res.status(500).json({ error: "Proxy internal error" });
+    console.error("[FLOW GENERATE ERROR]", err);
+    return res.status(500).json({ error: "Flow generate failed" });
   }
 });
 
-// Start server
+/* =======================
+   Poll Status
+======================= */
+app.get("/api/flow/veo/status/:jobId", async (req, res) => {
+  const token = getBearerToken(req);
+  if (!token) {
+    return res.status(401).json({ error: "Missing Authorization Bearer token" });
+  }
+
+  try {
+    const resp = await fetch(
+      `https://labs.google/fx/api/veo/status/${req.params.jobId}`,
+      {
+        headers: {
+          "Authorization": `Bearer ${token}`
+        }
+      }
+    );
+
+    const data = await resp.json();
+    return res.status(resp.status).json(data);
+  } catch (err) {
+    console.error("[FLOW STATUS ERROR]", err);
+    return res.status(500).json({ error: "Flow status failed" });
+  }
+});
+
+/* =======================
+   Start Server
+======================= */
 app.listen(PORT, () => {
-  console.log("VictorSharp Labs Proxy listening on port", PORT);
-  console.log("Your service is live ✨");
-  console.log("////////////////////////////////////////////////////////");
+  console.log("VictorSharp Flow Veo3 Proxy running on port", PORT);
 });
