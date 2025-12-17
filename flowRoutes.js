@@ -1,191 +1,263 @@
-// flowRoutes.js (ESM) - VictorSharp Flow Veo Proxy Routes
+// flowRoutes.js (ESM) — VictorSharp Flow Veo3 Proxy Routes
+// Supports BOTH:
+//   POST /api/flow/veo/generate      + /api/flow/video/generate
+//   GET  /api/flow/veo/status/:id    + /api/flow/video/status/:id
+//   POST /api/flow/session/validate
+//
+// Node 18+ has global fetch (Render Node 22+ OK)
+
 import express from "express";
-import fetch from "node-fetch";
 
 const router = express.Router();
 
 /** =========================
- *  Helpers
+ *  Upstream config (override via Render ENV)
  *  ========================= */
-function getBearerToken(req) {
+const FLOW_BASE_URL = (process.env.FLOW_BASE_URL || "https://labs.google").replace(/\/+$/, "");
+
+// Session validate endpoint (GET)
+const FLOW_SESSION_VALIDATE_URL =
+  (process.env.FLOW_SESSION_VALIDATE_URL || `${FLOW_BASE_URL}/fx/api/auth/session`).replace(/\/+$/, "");
+
+// Generate endpoint (POST)
+const FLOW_VEO_GENERATE_URL =
+  (process.env.FLOW_VEO_GENERATE_URL || `${FLOW_BASE_URL}/fx/api/video/generate`).replace(/\/+$/, "");
+
+// Status endpoint prefix (GET {prefix}/{id})
+const FLOW_VEO_STATUS_URL =
+  (process.env.FLOW_VEO_STATUS_URL || `${FLOW_BASE_URL}/fx/api/video/status`).replace(/\/+$/, "");
+
+/** =========================
+ * Helpers
+ * ========================= */
+function safeSnippet(v, max = 1200) {
+  if (v == null) return "";
+  const s = typeof v === "string" ? v : JSON.stringify(v);
+  return s.length > max ? s.slice(0, max) + "..." : s;
+}
+
+function pickBearer(req) {
   const auth = req.headers.authorization || "";
-  if (!auth.startsWith("Bearer ")) return null;
-  return auth.slice("Bearer ".length).trim();
+  if (typeof auth === "string" && auth.toLowerCase().startsWith("bearer ")) {
+    return auth.trim(); // keep "Bearer xxx"
+  }
+  // fallback: accept token in body for convenience
+  const t = req.body?.access_token || req.body?.token;
+  if (t && typeof t === "string" && t.trim()) return `Bearer ${t.trim()}`;
+  return "";
 }
 
 async function readUpstreamBody(resp) {
-  // labs.google đôi khi trả HTML hoặc JSON rỗng "{}"
-  const text = await resp.text().catch(() => "");
-  if (!text) return { text: "", json: null };
+  const text = await resp.text();
   try {
-    return { text, json: JSON.parse(text) };
+    return { kind: "json", data: JSON.parse(text) };
   } catch {
-    return { text, json: null };
+    return { kind: "text", data: text };
   }
 }
 
-function upstreamError(res, message, upstreamUrl, upstreamStatus, upstreamBody) {
-  return res.status(200).json({
-    ok: false,
-    error: message,
-    upstream: upstreamUrl,
-    upstreamStatus,
-    upstreamBody: upstreamBody ?? "",
-  });
+function log(tag, obj) {
+  try {
+    console.log(`[${tag}]`, JSON.stringify(obj));
+  } catch {
+    console.log(`[${tag}]`, obj);
+  }
 }
 
 /** =========================
- *  Upstream endpoints (Render ENV)
- *  =========================
- * Bạn đang set ở Render:
- * FLOW_VEO_GENERATE_URL = https://labs.google/fx/api/video/generate
- * FLOW_VEO_STATUS_URL   = https://labs.google/fx/api/video/status
- *
- * Nếu thiếu ENV thì fallback về giá trị này.
- */
-const FLOW_VEO_GENERATE_URL =
-  process.env.FLOW_VEO_GENERATE_URL || "https://labs.google/fx/api/video/generate";
-
-const FLOW_VEO_STATUS_URL =
-  process.env.FLOW_VEO_STATUS_URL || "https://labs.google/fx/api/video/status";
-
-const FLOW_SESSION_VALIDATE_URL =
-  process.env.FLOW_SESSION_VALIDATE_URL || "https://labs.google/fx/api/auth/session";
-
-/** =========================
- *  Session Validate
- *  POST /api/flow/session/validate
- *  Header: Authorization: Bearer <access_token>
- *  ========================= */
+ * POST /api/flow/session/validate
+ * Header: Authorization: Bearer <token>
+ * ========================= */
 router.post("/session/validate", async (req, res) => {
-  const token = getBearerToken(req);
-  if (!token) {
-    return res.status(401).json({ ok: false, error: "Missing Authorization: Bearer <token>" });
+  const bearer = pickBearer(req);
+
+  log("FLOW_VALIDATE", {
+    path: req.path,
+    hasAuth: !!bearer,
+    upstream: FLOW_SESSION_VALIDATE_URL,
+  });
+
+  if (!bearer) {
+    return res.status(401).json({
+      ok: false,
+      error: "Missing Authorization header. Expected: Bearer <token>",
+    });
   }
 
   try {
-    const upstreamUrl = FLOW_SESSION_VALIDATE_URL;
-
-    const resp = await fetch(upstreamUrl, {
+    const upstreamRes = await fetch(FLOW_SESSION_VALIDATE_URL, {
       method: "GET",
       headers: {
-        Authorization: `Bearer ${token}`,
-        "Accept": "application/json,text/plain,*/*",
+        Authorization: bearer,
+        Accept: "application/json,text/plain,*/*",
       },
     });
 
-    const { text, json } = await readUpstreamBody(resp);
+    const body = await readUpstreamBody(upstreamRes);
 
-    // OK => cho pass
-    if (resp.ok) {
-      return res.json({ ok: true, upstream: upstreamUrl });
+    if (!upstreamRes.ok) {
+      return res.status(upstreamRes.status).json({
+        ok: false,
+        error: "Session validate failed",
+        upstream: FLOW_SESSION_VALIDATE_URL,
+        upstreamStatus: upstreamRes.status,
+        upstreamBody: body.kind === "json" ? body.data : safeSnippet(body.data, 4000),
+      });
     }
 
-    // Fail => trả kèm upstreamStatus/upstreamBody để debug trên WebApp
-    return upstreamError(res, "Session validate failed", upstreamUrl, resp.status, text || "{}");
+    return res.status(200).json({
+      ok: true,
+      upstream: FLOW_SESSION_VALIDATE_URL,
+      data: body.kind === "json" ? body.data : body.data,
+    });
   } catch (err) {
-    return upstreamError(res, `Session validate exception: ${err?.message || err}`, FLOW_SESSION_VALIDATE_URL, 0, "");
+    return res.status(502).json({
+      ok: false,
+      error: "Session validate failed (proxy fetch error)",
+      upstream: FLOW_SESSION_VALIDATE_URL,
+      detail: String(err?.message || err),
+    });
   }
 });
 
 /** =========================
- *  Create Job (Generate Video)
- *  POST /api/flow/veo/generate
- *  POST /api/flow/video/generate   (alias)
- *  Body: JSON payload from WebApp
- *  ========================= */
+ * POST /api/flow/veo/generate  (alias: /video/generate)
+ * Body: JSON payload from WebApp
+ * ========================= */
 async function handleGenerate(req, res) {
-  const token = getBearerToken(req);
-  if (!token) {
-    return res.status(401).json({ ok: false, error: "Missing Authorization: Bearer <token>" });
+  const bearer = pickBearer(req);
+  const payload = req.body || {};
+
+  log("FLOW_GENERATE", {
+    path: req.path,
+    hasAuth: !!bearer,
+    upstream: FLOW_VEO_GENERATE_URL,
+    promptPreview: safeSnippet(payload?.prompt || "", 120),
+  });
+
+  if (!bearer) {
+    return res.status(401).json({
+      ok: false,
+      error: "Missing Authorization header. Expected: Bearer <token>",
+    });
   }
 
-  const payload = req.body;
   if (!payload || typeof payload !== "object") {
     return res.status(400).json({ ok: false, error: "Missing/invalid JSON body" });
   }
 
-  const upstreamUrl = FLOW_VEO_GENERATE_URL;
-
   try {
-    const resp = await fetch(upstreamUrl, {
+    const upstreamRes = await fetch(FLOW_VEO_GENERATE_URL, {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${token}`,
+        Authorization: bearer,
         "Content-Type": "application/json",
-        "Accept": "application/json,text/plain,*/*",
+        Accept: "application/json,text/plain,*/*",
       },
       body: JSON.stringify(payload),
     });
 
-    const { text, json } = await readUpstreamBody(resp);
+    const body = await readUpstreamBody(upstreamRes);
 
-    // Nếu upstream trả JSON hợp lệ => forward nguyên JSON
-    if (json) {
-      return res.status(resp.status).json(json);
+    if (!upstreamRes.ok) {
+      return res.status(upstreamRes.status).json({
+        ok: false,
+        error: `Create Job Failed (${upstreamRes.status})`,
+        upstream: FLOW_VEO_GENERATE_URL,
+        upstreamStatus: upstreamRes.status,
+        upstreamBody: body.kind === "json" ? body.data : safeSnippet(body.data, 4000),
+      });
     }
 
-    // Nếu upstream trả HTML/text => vẫn trả để WebApp thấy upstreamBody
-    return res.status(resp.status).json({
-      ok: resp.ok,
-      upstream: upstreamUrl,
-      upstreamStatus: resp.status,
-      upstreamBody: text,
+    return res.status(200).json({
+      ok: true,
+      upstream: FLOW_VEO_GENERATE_URL,
+      data: body.kind === "json" ? body.data : body.data,
     });
   } catch (err) {
-    return upstreamError(res, `Flow generate exception: ${err?.message || err}`, upstreamUrl, 0, "");
+    return res.status(502).json({
+      ok: false,
+      error: "Flow generate failed (proxy fetch error)",
+      upstream: FLOW_VEO_GENERATE_URL,
+      detail: String(err?.message || err),
+    });
   }
 }
 
 router.post("/veo/generate", handleGenerate);
-router.post("/video/generate", handleGenerate); // alias cho WebApp nếu đổi path
+router.post("/video/generate", handleGenerate);
 
 /** =========================
- *  Poll Status
- *  GET /api/flow/veo/status/:jobId
- *  GET /api/flow/video/status/:jobId   (alias)
- *  ========================= */
+ * GET /api/flow/veo/status/:id  (alias: /video/status/:id)
+ * ========================= */
 async function handleStatus(req, res) {
-  const token = getBearerToken(req);
-  if (!token) {
-    return res.status(401).json({ ok: false, error: "Missing Authorization: Bearer <token>" });
-  }
+  const bearer = pickBearer(req);
+  const id = req.params.id;
 
-  const jobId = req.params.jobId;
-  if (!jobId) {
-    return res.status(400).json({ ok: false, error: "Missing jobId" });
-  }
+  const upstreamUrl = `${FLOW_VEO_STATUS_URL}/${encodeURIComponent(id)}`;
 
-  const upstreamUrl = `${FLOW_VEO_STATUS_URL}/${encodeURIComponent(jobId)}`;
+  log("FLOW_STATUS", {
+    path: req.path,
+    hasAuth: !!bearer,
+    upstream: upstreamUrl,
+  });
+
+  if (!bearer) {
+    return res.status(401).json({
+      ok: false,
+      error: "Missing Authorization header. Expected: Bearer <token>",
+    });
+  }
 
   try {
-    const resp = await fetch(upstreamUrl, {
+    const upstreamRes = await fetch(upstreamUrl, {
       method: "GET",
       headers: {
-        Authorization: `Bearer ${token}`,
-        "Accept": "application/json,text/plain,*/*",
+        Authorization: bearer,
+        Accept: "application/json,text/plain,*/*",
       },
     });
 
-    const { text, json } = await readUpstreamBody(resp);
+    const body = await readUpstreamBody(upstreamRes);
 
-    if (json) {
-      return res.status(resp.status).json(json);
+    if (!upstreamRes.ok) {
+      return res.status(upstreamRes.status).json({
+        ok: false,
+        error: `Status Failed (${upstreamRes.status})`,
+        upstream: upstreamUrl,
+        upstreamStatus: upstreamRes.status,
+        upstreamBody: body.kind === "json" ? body.data : safeSnippet(body.data, 4000),
+      });
     }
 
-    return res.status(resp.status).json({
-      ok: resp.ok,
+    return res.status(200).json({
+      ok: true,
       upstream: upstreamUrl,
-      upstreamStatus: resp.status,
-      upstreamBody: text,
+      data: body.kind === "json" ? body.data : body.data,
     });
   } catch (err) {
-    return upstreamError(res, `Flow status exception: ${err?.message || err}`, upstreamUrl, 0, "");
+    return res.status(502).json({
+      ok: false,
+      error: "Flow status failed (proxy fetch error)",
+      upstream: upstreamUrl,
+      detail: String(err?.message || err),
+    });
   }
 }
 
-router.get("/veo/status/:jobId", handleStatus);
-router.get("/video/status/:jobId", handleStatus); // alias
+router.get("/veo/status/:id", handleStatus);
+router.get("/video/status/:id", handleStatus);
+
+// Debug (optional)
+router.get("/debug/env", (_req, res) => {
+  res.json({
+    ok: true,
+    FLOW_BASE_URL,
+    FLOW_SESSION_VALIDATE_URL,
+    FLOW_VEO_GENERATE_URL,
+    FLOW_VEO_STATUS_URL,
+  });
+});
 
 export default router;
 export { router };
