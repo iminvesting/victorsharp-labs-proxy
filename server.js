@@ -1,5 +1,5 @@
 // server.js (ESM)
-// NOTE: Project uses "type": "module" => must use import, NOT require
+// ✅ Works with package.json: { "type": "module" }
 
 import express from "express";
 import cors from "cors";
@@ -7,36 +7,38 @@ import flowRoutes from "./flowRoutes.js";
 
 const app = express();
 
-// If behind Render/Proxy
+const PORT = process.env.PORT || 10000;
+
+// Trust proxy (Render)
 app.set("trust proxy", 1);
 
-// CORS (allow app web / aistudio / local)
+// CORS (open, because this is a proxy service)
 app.use(
   cors({
-    origin: "*",
+    origin: true,
+    credentials: true,
     methods: ["GET", "POST", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
 
-// Body parser
-app.use(express.json({ limit: "10mb" }));
+// Body parsing
+app.use(express.json({ limit: "2mb" }));
 app.use(express.urlencoded({ extended: true }));
 
-// Root
+// Basic health + root
 app.get("/", (_req, res) => {
   res.type("text/plain").send("victorsharp-labs-proxy is running");
 });
 
-// Health
 app.get("/health", (_req, res) => {
   res.json({ ok: true, service: "victorsharp-labs-proxy", ts: Date.now() });
 });
 
-// Mount Flow routes
+// Mount Flow API
 app.use("/api/flow", flowRoutes);
 
-// 404 JSON
+// 404
 app.use((req, res) => {
   res.status(404).json({
     ok: false,
@@ -48,14 +50,14 @@ app.use((req, res) => {
 
 // Error handler
 app.use((err, _req, res, _next) => {
+  console.error("[SERVER_ERROR]", err);
   res.status(500).json({
     ok: false,
-    error: "Server Error",
-    detail: String(err?.message || err),
+    error: "Internal Server Error",
+    message: err?.message || String(err),
   });
 });
 
-const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`[FLOW-BACKEND] listening on port ${PORT}`);
 });
