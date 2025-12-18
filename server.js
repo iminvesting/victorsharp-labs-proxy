@@ -1,58 +1,64 @@
+/**
+ * VictorSharp Labs Proxy - server.js
+ * Exposes:
+ *  - GET  /health
+ *  - /api/flow/*  (handled by flowRoutes.js)
+ */
+
 import express from "express";
 import cors from "cors";
+import compression from "compression";
+import morgan from "morgan";
 import flowRoutes from "./flowRoutes.js";
 
 const app = express();
 
-// CORS (AI Studio iframe + mọi origin)
+const PORT = process.env.PORT || 10000;
+
+// --- middleware ---
+app.use(compression());
+
+// CORS: allow all (safe for proxy). If you want to restrict, set CORS_ORIGIN env.
 app.use(
   cors({
-    origin: "*",
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "Origin", "Accept"],
+    origin: process.env.CORS_ORIGIN || "*",
+    credentials: false,
   })
 );
 
-// Logger
-app.use((req, _res, next) => {
-  console.log(`[INCOMING] ${req.method} ${req.originalUrl}`);
-  next();
+app.use(express.json({ limit: "25mb" }));
+app.use(express.urlencoded({ extended: true, limit: "25mb" }));
+
+app.use(
+  morgan(":method :url :status :res[content-length] - :response-time ms")
+);
+
+// --- basic routes ---
+app.get("/", (req, res) => {
+  res.status(200).send("VictorSharp Labs Proxy is running.");
 });
 
-// Body lớn
-app.use(express.json({ limit: "50mb" }));
-
-// Health
-app.get("/health", (_req, res) => {
-  return res.status(200).json({ ok: true, service: "victorsharp-labs-proxy", ts: Date.now() });
+app.get("/health", (req, res) => {
+  res.status(200).json({ ok: true, service: "victorsharp-labs-proxy", ts: Date.now() });
 });
 
-// ✅ Route chuẩn
+// --- api routes ---
 app.use("/api/flow", flowRoutes);
 
-// ✅ “Chống lệch route” (fix case webapp gọi nhầm /api/flow/api/flow/*)
-app.use("/api/flow/api/flow", flowRoutes);
-
-// Root
-app.get("/", (_req, res) => {
-  res
-    .status(200)
-    .send(
-      "VictorSharp Labs Proxy is running. Try GET /health or POST /api/flow/session/validate"
-    );
+// 404 fallback
+app.use((req, res) => {
+  res.status(404).json({ ok: false, error: "Not Found", path: req.path });
 });
 
-// 404 fallback rõ ràng
-app.use((req, res) => {
-  res.status(404).json({
+// error handler
+app.use((err, req, res, next) => {
+  console.error("[SERVER_ERROR]", err);
+  res.status(500).json({
     ok: false,
-    error: "API Endpoint Not Found",
-    hint: "Use POST /api/flow/session/validate, POST /api/flow/video/generate, POST /api/flow/video/status",
-    path: req.originalUrl,
+    error: err?.message || "Internal Server Error",
   });
 });
 
-const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`[FLOW-BACKEND] listening on port ${PORT}`);
 });
