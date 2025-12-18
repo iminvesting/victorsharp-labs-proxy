@@ -1,68 +1,43 @@
-// server.js (ESM)
-// VictorSharp Flow Proxy Backend (Render)
-// - GET  /health
-// - Mount /api/flow -> flowRoutes
-// - 404 JSON: { ok:false, error:"API Endpoint Not Found", method, path }
+/* server.js - CommonJS */
+const express = require("express");
+const cors = require("cors");
 
-import express from "express";
-import cors from "cors";
-import flowRoutes from "./flowRoutes.js";
+const flowRoutes = require("./flowRoutes");
 
 const app = express();
 
-app.set("trust proxy", true);
+// Render / proxies
+app.set("trust proxy", 1);
 
+// Body
+app.use(express.json({ limit: "25mb" }));
+app.use(express.urlencoded({ extended: true, limit: "25mb" }));
+
+// CORS (cho webapp chạy ở AI Studio / domain khác)
 app.use(
   cors({
     origin: true,
     credentials: true,
-    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: [
-      "Content-Type",
-      "Authorization",
-      "X-Requested-With",
-      "X-Flow-Session",
-      "X-Flow-Cookie",
-      "X-Flow-Token",
-    ],
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
   })
 );
 
-app.use(express.json({ limit: "25mb" }));
-app.use(express.urlencoded({ extended: true, limit: "25mb" }));
+app.get("/", (_req, res) => res.send("victorsharp-labs-proxy is running"));
+app.get("/health", (_req, res) =>
+  res.json({ ok: true, service: "victorsharp-labs-proxy", ts: Date.now() })
+);
 
-app.use((req, _res, next) => {
-  console.log(`[INCOMING] ${req.method} ${req.path}`);
-  next();
-});
-
-app.get("/", (_req, res) => {
-  res.type("text/plain").send("victorsharp-labs-proxy is running");
-});
-
-app.get("/health", (_req, res) => {
-  res.json({ ok: true, service: "victorsharp-labs-proxy", ts: Date.now() });
-});
-
-// mount routes
+// API
 app.use("/api/flow", flowRoutes);
 
-// 404 fallback (MATCH format your frontend is showing)
+// 404 handler
 app.use((req, res) => {
   res.status(404).json({
     ok: false,
     error: "API Endpoint Not Found",
     method: req.method,
     path: req.path,
-  });
-});
-
-// global error
-app.use((err, _req, res, _next) => {
-  console.error("[SERVER_ERROR]", err);
-  res.status(500).json({
-    ok: false,
-    error: err?.message || "Internal Server Error",
   });
 });
 
