@@ -1,22 +1,23 @@
 import express from "express";
 import cors from "cors";
-import path from "path";
-import { fileURLToPath } from "url";
 import flowRoutes from "./flowRoutes.js";
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
 const app = express();
 
-// CORS for AI Studio iframe
+/**
+ * CORS: Cho AI Studio iframe gọi được (origin có thể là aistudio.google.com)
+ * Lưu ý: nếu bạn bật credentials thì origin không thể là '*'.
+ * Ở đây ta để permissive nhất để debug ổn định.
+ */
 app.use(
   cors({
     origin: "*",
-    methods: ["GET", "POST", "OPTIONS"],
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization", "Origin", "Accept"],
   })
 );
+
+// Preflight
 app.options("*", cors());
 
 // Logger
@@ -27,29 +28,37 @@ app.use((req, _res, next) => {
 
 // Body
 app.use(express.json({ limit: "50mb" }));
-app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 
-// Health
+/**
+ * Health
+ */
 app.get("/health", (_req, res) => {
   res.status(200).json({ ok: true, service: "victorsharp-labs-proxy", ts: Date.now() });
 });
 
-// API routes
+/**
+ * API routes
+ * ==> TẤT CẢ endpoint nằm dưới /api/flow/*
+ */
 app.use("/api/flow", flowRoutes);
 
-// (Optional) serve dist if you bundle frontend into proxy
-app.use(express.static(path.join(__dirname, "dist")));
-
-// SPA fallback: NEVER swallow /api/flow
-app.get("*", (req, res) => {
-  if (req.path.startsWith("/api/flow")) {
-    return res.status(404).json({ ok: false, error: "API Endpoint Not Found" });
-  }
-
-  const indexPath = path.join(__dirname, "dist", "index.html");
-  res.sendFile(indexPath, (err) => {
-    if (err) res.status(200).send("Proxy backend is running. Frontend not deployed.");
+/**
+ * Fallback cho API (để khỏi trả HTML)
+ */
+app.all("/api/*", (req, res) => {
+  res.status(404).json({
+    ok: false,
+    error: "API Endpoint Not Found",
+    path: req.originalUrl,
+    method: req.method,
   });
+});
+
+/**
+ * Root
+ */
+app.get("/", (_req, res) => {
+  res.status(200).send("victorsharp-labs-proxy is running. Use /health or /api/flow/*");
 });
 
 const PORT = process.env.PORT || 3001;
