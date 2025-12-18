@@ -1,10 +1,9 @@
 // flowRoutes.js (ESM)
-
 import express from "express";
 
 const router = express.Router();
 
-// Google Labs endpoint bạn đang forward tới
+// Endpoint Google Labs
 const LABS_SESSION_URL = "https://labs.google/fx/api/auth/session";
 
 // -----------------------------
@@ -13,7 +12,9 @@ const LABS_SESSION_URL = "https://labs.google/fx/api/auth/session";
 function isJsonLikeString(s) {
   if (typeof s !== "string") return false;
   const t = s.trim();
-  return (t.startsWith("{") && t.endsWith("}")) || (t.startsWith("[") && t.endsWith("]"));
+  return (
+    (t.startsWith("{") && t.endsWith("}")) || (t.startsWith("[") && t.endsWith("]"))
+  );
 }
 
 function safeJsonParse(s) {
@@ -26,25 +27,30 @@ function safeJsonParse(s) {
 
 /**
  * Accepts:
- * - string token (ya29....)
+ * - string token (ya29....) OR "Bearer ya29..."
  * - JSON string ( {"access_token":"..."} or {"token":"..."} or any object)
  * - object
  */
-function normalizeSessionInput(input) {
-  let raw = input;
+function normalizeSessionInput(body) {
+  let raw = body;
 
-  // If body is like { session: "...." } ok. If missing, raw may be entire body.
+  // preferred: { session: ... }
   if (raw && typeof raw === "object" && raw.session !== undefined) raw = raw.session;
 
-  // If it's a JSON string, parse it
+  // if string json -> parse
   if (isJsonLikeString(raw)) {
     const parsed = safeJsonParse(raw);
     if (parsed !== null) raw = parsed;
   }
 
-  // Extract a token if possible
   let token = null;
-  if (typeof raw === "string") token = raw.trim();
+
+  if (typeof raw === "string") {
+    const t = raw.trim();
+    // allow user paste "Bearer xxx"
+    token = t.toLowerCase().startsWith("bearer ") ? t.slice(7).trim() : t;
+  }
+
   if (raw && typeof raw === "object") {
     token =
       raw.access_token ||
@@ -57,46 +63,139 @@ function normalizeSessionInput(input) {
   return { raw, token };
 }
 
-async function forwardToLabsSession({ raw, token }) {
-  // Strategy A: POST JSON body (most stable for proxies)
-  // We send { session: <raw> } even if raw is object or string.
-  const headers = {
-    "Content-Type": "application/json",
-    "Accept": "application/json, text/plain, */*",
-  };
-
-  // If token looks like oauth token, also attach Authorization (harmless if ignored)
-  if (typeof token === "string" && token.length > 20) {
-    headers["Authorization"] = `Bearer ${token}`;
-  }
-
-  const resp = await fetch(LABS_SESSION_URL, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({ session: raw }),
-  });
-
+async function readUpstream(resp) {
   const text = await resp.text();
-  let data;
+  let data = null;
   try {
     data = JSON.parse(text);
   } catch {
-    data = { raw: text };
+    data = null;
+  }
+  return {
+    status: resp.status,
+    ok: resp.ok,
+    contentType: resp.headers.get("content-type") || "",
+    // keep short snippet for debugging
+    textSnippet: text?.slice(0, 500),
+    data,
+  };
+}
+
+async function fetchWithTimeout(url, init, timeoutMs = 25000) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const resp = await fetch(url, { ...init, signal: controller.signal });
+    return resp;
+  } finally {
+    clearTimeout(id);
+  }
+}
+
+/**
+ * Multi-strategy:
+ * 1) GET with Authorization Bearer <token>  (thường đúng nhất để đọc session hiện tại)
+ * 2) POST empty body + Authorization (fallback)
+ * 3) POST JSON {session: raw} (last resort - một số proxy custom dùng kiểu này)
+ */
+async function forwardToLabsSession({ raw, token }) {
+  const headersBase = {
+    Accept: "application/json, text/plain, */*",
+    "User-Agent": "victorsharp-labs-proxy/1.0",
+  };
+
+  const authHeaders =
+    typeof token === "string" && token.length > 20
+      ? { Authorization: `Bearer ${token}` }
+      : {};
+
+  const attempts = [];
+
+  // Strategy 1: GET + Bearer
+  try {
+    const resp = await fetchWithTimeout(
+      LABS_SESSION_URL,
+      {
+        method: "GET",
+        headers: { ...headersBase, ...authHeaders },
+      },
+      25000
+    );
+    const out = await readUpstream(resp);
+    attempts.push({ strategy: "GET_BEARER", ...out });
+    if (out.ok) return { picked: "GET_BEARER", out, attempts };
+  } catch (e) {
+    attempts.push({
+      strategy: "GET_BEARER",
+      ok: false,
+      status: 0,
+      error: e?.name === "AbortError" ? "UPSTREAM_TIMEOUT" : (e?.message || String(e)),
+    });
   }
 
-  return { status: resp.status, ok: resp.ok, data };
+  // Strategy 2: POST (no body) + Bearer
+  try {
+    const resp = await fetchWithTimeout(
+      LABS_SESSION_URL,
+      {
+        method: "POST",
+        headers: {
+          ...headersBase,
+          ...authHeaders,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({}),
+      },
+      25000
+    );
+    const out = await readUpstream(resp);
+    attempts.push({ strategy: "POST_EMPTY_JSON", ...out });
+    if (out.ok) return { picked: "POST_EMPTY_JSON", out, attempts };
+  } catch (e) {
+    attempts.push({
+      strategy: "POST_EMPTY_JSON",
+      ok: false,
+      status: 0,
+      error: e?.name === "AbortError" ? "UPSTREAM_TIMEOUT" : (e?.message || String(e)),
+    });
+  }
+
+  // Strategy 3: POST {session: raw} (last resort)
+  try {
+    const resp = await fetchWithTimeout(
+      LABS_SESSION_URL,
+      {
+        method: "POST",
+        headers: {
+          ...headersBase,
+          ...authHeaders,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ session: raw }),
+      },
+      25000
+    );
+    const out = await readUpstream(resp);
+    attempts.push({ strategy: "POST_SESSION_WRAPPER", ...out });
+    return { picked: "POST_SESSION_WRAPPER", out, attempts };
+  } catch (e) {
+    attempts.push({
+      strategy: "POST_SESSION_WRAPPER",
+      ok: false,
+      status: 0,
+      error: e?.name === "AbortError" ? "UPSTREAM_TIMEOUT" : (e?.message || String(e)),
+    });
+    return { picked: "POST_SESSION_WRAPPER", out: null, attempts };
+  }
 }
 
 // -----------------------------
 // Routes
 // -----------------------------
-
-// Optional: quick ping for this router
 router.get("/health", (_req, res) => {
   res.json({ ok: true, scope: "flow", ts: Date.now() });
 });
 
-// IMPORTANT: your browser GET should show Method Not Allowed (expected)
 router.get("/session/validate", (_req, res) => {
   res.status(405).json({
     ok: false,
@@ -105,7 +204,6 @@ router.get("/session/validate", (_req, res) => {
   });
 });
 
-// This is what your WebApp should call
 router.post("/session/validate", async (req, res) => {
   try {
     const normalized = normalizeSessionInput(req.body);
@@ -120,13 +218,30 @@ router.post("/session/validate", async (req, res) => {
 
     console.log("[FLOW_VALIDATE] ->", LABS_SESSION_URL);
 
-    const out = await forwardToLabsSession(normalized);
+    const result = await forwardToLabsSession(normalized);
 
-    // Pass-through status, but keep a consistent wrapper
-    return res.status(out.status).json({
-      ok: out.ok,
-      upstreamStatus: out.status,
-      data: out.data,
+    // If we got an upstream response, pass-through its status
+    if (result?.out) {
+      const upstream = result.out;
+
+      return res.status(upstream.status).json({
+        ok: upstream.ok,
+        upstreamStatus: upstream.status,
+        picked: result.picked,
+        // if JSON, return json; else return snippet
+        data: upstream.data ?? { raw: upstream.textSnippet },
+        debug: {
+          attempts: result.attempts,
+        },
+      });
+    }
+
+    // No upstream response (network/timeout)
+    return res.status(502).json({
+      ok: false,
+      error: "Bad Gateway",
+      message: "No upstream response",
+      debug: { attempts: result?.attempts || [] },
     });
   } catch (e) {
     console.error("[FLOW_VALIDATE_ERROR]", e);
