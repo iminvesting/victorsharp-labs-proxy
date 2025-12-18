@@ -1,56 +1,71 @@
 /**
- * VictorSharp Labs Proxy - server.js
- * Exposes:
- *  - GET  /health
- *  - /api/flow/*  (handled by flowRoutes.js)
+ * server.js
+ * VictorSharp Flow Proxy Backend (Render)
+ * - GET  /health
+ * - Mount /api/flow -> flowRoutes
  */
 
-import express from "express";
-import cors from "cors";
-import compression from "compression";
-import morgan from "morgan";
-import flowRoutes from "./flowRoutes.js";
+const express = require("express");
+const cors = require("cors");
+
+const flowRoutes = require("./flowRoutes");
 
 const app = express();
 
-const PORT = process.env.PORT || 10000;
+// Trust proxy (Render/Cloudflare) + stable logs
+app.set("trust proxy", true);
 
-// --- middleware ---
-app.use(compression());
-
-// CORS: allow all (safe for proxy). If you want to restrict, set CORS_ORIGIN env.
+// CORS: allow from anywhere (AS preview domain, local, etc.)
 app.use(
   cors({
-    origin: process.env.CORS_ORIGIN || "*",
-    credentials: false,
+    origin: true,
+    credentials: true,
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: [
+      "Content-Type",
+      "Authorization",
+      "X-Requested-With",
+      "X-Flow-Session",
+      "X-Flow-Cookie",
+      "X-Flow-Token",
+    ],
   })
 );
 
+// JSON body
 app.use(express.json({ limit: "25mb" }));
 app.use(express.urlencoded({ extended: true, limit: "25mb" }));
 
-app.use(
-  morgan(":method :url :status :res[content-length] - :response-time ms")
-);
+// Small request logger (helps debug 404/route mismatch)
+app.use((req, res, next) => {
+  const t = new Date().toISOString();
+  console.log(`[${t}] [INCOMING] ${req.method} ${req.path}`);
+  next();
+});
 
-// --- basic routes ---
 app.get("/", (req, res) => {
-  res.status(200).send("VictorSharp Labs Proxy is running.");
+  res.type("text/plain").send("victorsharp-labs-proxy is running");
 });
 
 app.get("/health", (req, res) => {
-  res.status(200).json({ ok: true, service: "victorsharp-labs-proxy", ts: Date.now() });
+  res.json({ ok: true, service: "victorsharp-labs-proxy", ts: Date.now() });
 });
 
-// --- api routes ---
+// IMPORTANT: mount under /api/flow
 app.use("/api/flow", flowRoutes);
 
-// 404 fallback
+// 404 fallback (so you can see which path is missing)
 app.use((req, res) => {
-  res.status(404).json({ ok: false, error: "Not Found", path: req.path });
+  res.status(404).json({
+    ok: false,
+    error: "Not Found",
+    path: req.path,
+    method: req.method,
+    hint: "Check your frontend is calling /api/flow/<route> (not duplicated /api/flow/api/flow).",
+  });
 });
 
-// error handler
+// Global error handler
 app.use((err, req, res, next) => {
   console.error("[SERVER_ERROR]", err);
   res.status(500).json({
@@ -59,6 +74,7 @@ app.use((err, req, res, next) => {
   });
 });
 
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`[FLOW-BACKEND] listening on port ${PORT}`);
 });
