@@ -1,13 +1,13 @@
 /**
- * flowRoutes.js
- * Routes under /api/flow
+ * flowRoutes.js - mounted at /api/flow
  *
- * - POST /session/validate
- * - POST /video/generate
+ * Routes:
+ *   POST /session/validate
+ *   POST /video/generate
  *
  * Upstream:
- * - https://labs.google/fx/api/auth/session
- * - https://labs.google/fx/api/video/generate
+ *   GET  https://labs.google/fx/api/auth/session
+ *   POST https://labs.google/fx/api/video/generate
  */
 
 const express = require("express");
@@ -16,10 +16,9 @@ const router = express.Router();
 const UPSTREAM_AUTH_SESSION = "https://labs.google/fx/api/auth/session";
 const UPSTREAM_VIDEO_GENERATE = "https://labs.google/fx/api/video/generate";
 
-// ------------------------------------------------------------
+// -------------------------
 // Helpers
-// ------------------------------------------------------------
-
+// -------------------------
 function safeJsonParse(str) {
   try {
     return JSON.parse(str);
@@ -29,20 +28,19 @@ function safeJsonParse(str) {
 }
 
 /**
- * Normalize user "session" input to a Cookie header string.
+ * Normalize user input -> cookie header
  * Accepts:
- * - raw token: "abc123..."
- * - cookie string: "__Secure-next-auth.session-token=...; other=..."
- * - JSON string/object: tries to find token/cookie fields
+ *  - raw token: "ya29..." OR just token string
+ *  - cookie string: "__Secure-next-auth.session-token=...; other=..."
+ *  - JSON string/object: tries to find cookie/token fields
  */
 function normalizeSessionToCookie(sessionInput) {
   if (!sessionInput) return "";
 
-  // If caller sent object (already parsed JSON)
+  // object
   if (typeof sessionInput === "object") {
     const obj = sessionInput;
 
-    // common candidates
     const cookie =
       obj.cookie ||
       obj.cookies ||
@@ -65,29 +63,28 @@ function normalizeSessionToCookie(sessionInput) {
       return `__Secure-next-auth.session-token=${token.trim()}`;
     }
 
-    // fallback: if object has a single string-ish field
+    // fallback: find any string containing "="
     for (const k of Object.keys(obj)) {
       const v = obj[k];
       if (typeof v === "string" && v.includes("=")) return v;
     }
-
     return "";
   }
 
-  // If string
+  // string
   const s = String(sessionInput).trim();
   if (!s) return "";
 
-  // If looks like JSON string
+  // JSON string?
   if ((s.startsWith("{") && s.endsWith("}")) || (s.startsWith("[") && s.endsWith("]"))) {
     const parsed = safeJsonParse(s);
     if (parsed) return normalizeSessionToCookie(parsed);
   }
 
-  // If user pasted full cookie header (contains '='), accept as-is
+  // cookie string?
   if (s.includes("=")) return s;
 
-  // Otherwise treat as raw token
+  // raw token
   return `__Secure-next-auth.session-token=${s}`;
 }
 
@@ -95,7 +92,6 @@ function buildUpstreamHeaders(cookieHeader) {
   const h = {
     accept: "application/json, text/plain, */*",
     "content-type": "application/json",
-    // emulate browser-ish headers (often helps with Labs endpoints)
     origin: "https://labs.google",
     referer: "https://labs.google/fx/",
     "user-agent":
@@ -107,16 +103,16 @@ function buildUpstreamHeaders(cookieHeader) {
 
 async function fetchWithTimeout(url, options = {}, timeoutMs = 45000) {
   const controller = new AbortController();
-  const id = setTimeout(() => controller.abort(), timeoutMs);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const res = await fetch(url, { ...options, signal: controller.signal });
     return res;
   } finally {
-    clearTimeout(id);
+    clearTimeout(timer);
   }
 }
 
-async function readBody(res) {
+async function readUpstream(res) {
   const ct = res.headers.get("content-type") || "";
   if (ct.includes("application/json")) {
     try {
@@ -125,44 +121,37 @@ async function readBody(res) {
       return { ok: false, error: "Upstream returned invalid JSON" };
     }
   }
-  const text = await res.text();
-  return text;
+  return await res.text();
 }
 
-// ------------------------------------------------------------
+// -------------------------
 // Routes
-// ------------------------------------------------------------
+// -------------------------
 
-// For humans opening in browser: show hint instead of "Not Found"
+// GET for human testing -> hint
 router.get("/session/validate", (req, res) => {
   res.status(405).json({
     ok: false,
     error: "Method Not Allowed",
-    hint: "Use POST /api/flow/session/validate with JSON body { session: <token or cookie or json> }",
+    hint: "Use POST /api/flow/session/validate with JSON body: { session: <token|cookie|json> }",
   });
 });
 
-/**
- * POST /api/flow/session/validate
- * Body: { session: <token|cookie|json> }
- */
+// POST validate
 router.post("/session/validate", async (req, res) => {
   try {
     const sessionInput =
-      req.body?.session ||
-      req.body?.token ||
-      req.body?.flowKey ||
+      (req.body && (req.body.session || req.body.token || req.body.flowKey)) ||
       req.headers["x-flow-session"] ||
       req.headers["x-flow-token"] ||
       req.headers["x-flow-cookie"];
 
     const cookieHeader = normalizeSessionToCookie(sessionInput);
-
     if (!cookieHeader) {
       return res.status(400).json({
         ok: false,
         error: "Missing session",
-        hint: "Send { session: <token or cookie> }",
+        hint: "Send JSON { session: <token or cookie> }",
       });
     }
 
@@ -170,42 +159,26 @@ router.post("/session/validate", async (req, res) => {
 
     const upstreamRes = await fetchWithTimeout(
       UPSTREAM_AUTH_SESSION,
-      {
-        method: "GET",
-        headers: buildUpstreamHeaders(cookieHeader),
-      },
+      { method: "GET", headers: buildUpstreamHeaders(cookieHeader) },
       30000
     );
 
-    const upstreamBody = await readBody(upstreamRes);
+    const upstreamBody = await readUpstream(upstreamRes);
 
-    // Decide "ok" based on status + body
-    const ok = upstreamRes.ok;
-
-    return res.status(ok ? 200 : 401).json({
-      ok,
+    return res.status(upstreamRes.ok ? 200 : 401).json({
+      ok: upstreamRes.ok,
       status: upstreamRes.status,
       upstream: UPSTREAM_AUTH_SESSION,
-      // keep response small but useful
       upstreamBody,
     });
   } catch (e) {
-    const msg =
-      e?.name === "AbortError"
-        ? "Upstream timeout (AbortError)"
-        : e?.message || "Validate failed";
-
+    const msg = e?.name === "AbortError" ? "Upstream timeout (AbortError)" : e?.message || "Validate failed";
     console.error("[FLOW_VALIDATE_ERROR]", e);
-
-    return res.status(500).json({
-      ok: false,
-      error: msg,
-      upstream: UPSTREAM_AUTH_SESSION,
-    });
+    return res.status(500).json({ ok: false, error: msg, upstream: UPSTREAM_AUTH_SESSION });
   }
 });
 
-// For humans opening in browser: show hint
+// GET for human testing -> hint
 router.get("/video/generate", (req, res) => {
   res.status(405).json({
     ok: false,
@@ -214,23 +187,16 @@ router.get("/video/generate", (req, res) => {
   });
 });
 
-/**
- * POST /api/flow/video/generate
- * Body: { session: <...>, ...payloadForLabs }
- * -> proxies to Labs generate endpoint
- */
+// POST generate
 router.post("/video/generate", async (req, res) => {
   try {
     const sessionInput =
-      req.body?.session ||
-      req.body?.token ||
-      req.body?.flowKey ||
+      (req.body && (req.body.session || req.body.token || req.body.flowKey)) ||
       req.headers["x-flow-session"] ||
       req.headers["x-flow-token"] ||
       req.headers["x-flow-cookie"];
 
     const cookieHeader = normalizeSessionToCookie(sessionInput);
-
     if (!cookieHeader) {
       return res.status(400).json({
         ok: false,
@@ -239,7 +205,7 @@ router.post("/video/generate", async (req, res) => {
       });
     }
 
-    // Remove session fields from payload before forwarding (clean)
+    // remove session keys before forwarding
     const payload = { ...(req.body || {}) };
     delete payload.session;
     delete payload.token;
@@ -257,7 +223,7 @@ router.post("/video/generate", async (req, res) => {
       90000
     );
 
-    const upstreamBody = await readBody(upstreamRes);
+    const upstreamBody = await readUpstream(upstreamRes);
 
     return res.status(upstreamRes.status).json({
       ok: upstreamRes.ok,
@@ -266,18 +232,9 @@ router.post("/video/generate", async (req, res) => {
       upstreamBody,
     });
   } catch (e) {
-    const msg =
-      e?.name === "AbortError"
-        ? "Upstream timeout (AbortError)"
-        : e?.message || "Generate failed";
-
+    const msg = e?.name === "AbortError" ? "Upstream timeout (AbortError)" : e?.message || "Generate failed";
     console.error("[FLOW_GENERATE_ERROR]", e);
-
-    return res.status(500).json({
-      ok: false,
-      error: msg,
-      upstream: UPSTREAM_VIDEO_GENERATE,
-    });
+    return res.status(500).json({ ok: false, error: msg, upstream: UPSTREAM_VIDEO_GENERATE });
   }
 });
 
