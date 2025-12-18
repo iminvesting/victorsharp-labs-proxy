@@ -4,187 +4,138 @@ import express from "express";
 
 const router = express.Router();
 
-// Google Labs endpoints (as you logged)
-const FLOW_BASE_URL = "https://labs.google";
-const FLOW_SESSION_VALIDATE_URL = `${FLOW_BASE_URL}/fx/api/auth/session`;
-const FLOW_VEO_GENERATE_URL = `${FLOW_BASE_URL}/fx/api/veo/generate`;
-const FLOW_VEO_STATUS_URL = `${FLOW_BASE_URL}/fx/api/veo/status`;
+// Google Labs endpoint bạn đang forward tới
+const LABS_SESSION_URL = "https://labs.google/fx/api/auth/session";
 
+// -----------------------------
 // Helpers
-function normalizeSessionInput(input) {
-  // allow user paste raw token, or full JSON string
-  if (!input) return null;
-  if (typeof input === "string") {
-    const t = input.trim();
-    if (!t) return null;
-
-    // If it's JSON text, parse it
-    if (t.startsWith("{") && t.endsWith("}")) {
-      try {
-        return JSON.parse(t);
-      } catch {
-        // fall through: treat as token
-      }
-    }
-    return t; // token
-  }
-  return input;
+// -----------------------------
+function isJsonLikeString(s) {
+  if (typeof s !== "string") return false;
+  const t = s.trim();
+  return (t.startsWith("{") && t.endsWith("}")) || (t.startsWith("[") && t.endsWith("]"));
 }
 
-function buildLabsHeaders(sessionInput) {
-  // You can adjust if Labs expects different auth style.
-  // Current implementation: send cookie-like/session payload through JSON body
-  // and also pass common headers.
-  return {
-    "Content-Type": "application/json",
-    "User-Agent": "VictorSharp-Labs-Proxy/1.0",
-  };
-}
-
-async function readUpstreamBody(resp) {
-  const ct = (resp.headers.get("content-type") || "").toLowerCase();
-  if (ct.includes("application/json")) {
-    return { kind: "json", data: await resp.json() };
+function safeJsonParse(s) {
+  try {
+    return JSON.parse(s);
+  } catch {
+    return null;
   }
-  return { kind: "text", data: await resp.text() };
 }
 
 /**
- * POST /api/flow/session/validate
- * body: { session: <token|string|json> }
+ * Accepts:
+ * - string token (ya29....)
+ * - JSON string ( {"access_token":"..."} or {"token":"..."} or any object)
+ * - object
  */
-router.post("/session/validate", async (req, res) => {
-  try {
-    const sessionInput = normalizeSessionInput(req.body?.session);
-    if (!sessionInput) {
-      return res.status(400).json({
-        ok: false,
-        error: "Missing session. Send JSON body: { session: <token or json> }",
-      });
-    }
+function normalizeSessionInput(input) {
+  let raw = input;
 
-    const upstreamUrl = FLOW_SESSION_VALIDATE_URL;
+  // If body is like { session: "...." } ok. If missing, raw may be entire body.
+  if (raw && typeof raw === "object" && raw.session !== undefined) raw = raw.session;
 
-    const upstreamResp = await fetch(upstreamUrl, {
-      method: "POST",
-      headers: buildLabsHeaders(sessionInput),
-      body: JSON.stringify({ session: sessionInput }),
-    });
-
-    const body = await readUpstreamBody(upstreamResp);
-
-    return res.status(upstreamResp.ok ? 200 : upstreamResp.status).json({
-      ok: upstreamResp.ok,
-      status: upstreamResp.status,
-      upstream: upstreamUrl,
-      data: body.data,
-    });
-  } catch (err) {
-    return res.status(502).json({
-      ok: false,
-      error: "Validate session failed (proxy fetch error)",
-      upstream: FLOW_SESSION_VALIDATE_URL,
-      detail: String(err?.message || err),
-    });
+  // If it's a JSON string, parse it
+  if (isJsonLikeString(raw)) {
+    const parsed = safeJsonParse(raw);
+    if (parsed !== null) raw = parsed;
   }
+
+  // Extract a token if possible
+  let token = null;
+  if (typeof raw === "string") token = raw.trim();
+  if (raw && typeof raw === "object") {
+    token =
+      raw.access_token ||
+      raw.token ||
+      raw.session ||
+      raw.value ||
+      null;
+  }
+
+  return { raw, token };
+}
+
+async function forwardToLabsSession({ raw, token }) {
+  // Strategy A: POST JSON body (most stable for proxies)
+  // We send { session: <raw> } even if raw is object or string.
+  const headers = {
+    "Content-Type": "application/json",
+    "Accept": "application/json, text/plain, */*",
+  };
+
+  // If token looks like oauth token, also attach Authorization (harmless if ignored)
+  if (typeof token === "string" && token.length > 20) {
+    headers["Authorization"] = `Bearer ${token}`;
+  }
+
+  const resp = await fetch(LABS_SESSION_URL, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ session: raw }),
+  });
+
+  const text = await resp.text();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    data = { raw: text };
+  }
+
+  return { status: resp.status, ok: resp.ok, data };
+}
+
+// -----------------------------
+// Routes
+// -----------------------------
+
+// Optional: quick ping for this router
+router.get("/health", (_req, res) => {
+  res.json({ ok: true, scope: "flow", ts: Date.now() });
 });
 
-// GET will show hint (so browser open won't confuse you)
+// IMPORTANT: your browser GET should show Method Not Allowed (expected)
 router.get("/session/validate", (_req, res) => {
-  return res.status(405).json({
+  res.status(405).json({
     ok: false,
     error: "Method Not Allowed",
     hint: "Use POST /api/flow/session/validate with JSON body { session: <token or json> }",
   });
 });
 
-/**
- * POST /api/flow/veo/generate
- * body: pass-through (expects you include session in body if needed)
- */
-router.post("/veo/generate", async (req, res) => {
+// This is what your WebApp should call
+router.post("/session/validate", async (req, res) => {
   try {
-    const upstreamUrl = FLOW_VEO_GENERATE_URL;
+    const normalized = normalizeSessionInput(req.body);
 
-    const upstreamResp = await fetch(upstreamUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "User-Agent": "VictorSharp-Labs-Proxy/1.0",
-      },
-      body: JSON.stringify(req.body ?? {}),
-    });
-
-    const body = await readUpstreamBody(upstreamResp);
-
-    return res.status(upstreamResp.ok ? 200 : upstreamResp.status).json({
-      ok: upstreamResp.ok,
-      status: upstreamResp.status,
-      upstream: upstreamUrl,
-      data: body.data,
-    });
-  } catch (err) {
-    return res.status(502).json({
-      ok: false,
-      error: "Veo generate failed (proxy fetch error)",
-      upstream: FLOW_VEO_GENERATE_URL,
-      detail: String(err?.message || err),
-    });
-  }
-});
-
-/**
- * GET /api/flow/veo/status/:id
- * GET /api/flow/video/status/:id (alias)
- */
-async function handleStatus(req, res) {
-  try {
-    const id = req.params?.id;
-    if (!id) {
-      return res.status(400).json({ ok: false, error: "Missing id" });
+    if (!normalized.raw) {
+      return res.status(400).json({
+        ok: false,
+        error: "Missing session",
+        hint: "POST JSON: { session: <token or json> }",
+      });
     }
 
-    const upstreamUrl = `${FLOW_VEO_STATUS_URL}/${encodeURIComponent(id)}`;
+    console.log("[FLOW_VALIDATE] ->", LABS_SESSION_URL);
 
-    const upstreamResp = await fetch(upstreamUrl, {
-      method: "GET",
-      headers: {
-        "User-Agent": "VictorSharp-Labs-Proxy/1.0",
-      },
+    const out = await forwardToLabsSession(normalized);
+
+    // Pass-through status, but keep a consistent wrapper
+    return res.status(out.status).json({
+      ok: out.ok,
+      upstreamStatus: out.status,
+      data: out.data,
     });
-
-    const body = await readUpstreamBody(upstreamResp);
-
-    return res.status(upstreamResp.ok ? 200 : upstreamResp.status).json({
-      ok: upstreamResp.ok,
-      status: upstreamResp.status,
-      upstream: upstreamUrl,
-      data: body.data,
-    });
-  } catch (err) {
-    return res.status(502).json({
+  } catch (e) {
+    console.error("[FLOW_VALIDATE_ERROR]", e);
+    return res.status(500).json({
       ok: false,
-      error: "Flow status failed (proxy fetch error)",
-      upstream: FLOW_VEO_STATUS_URL,
-      detail: String(err?.message || err),
+      error: "Validate failed",
+      message: e?.message || String(e),
     });
   }
-}
-
-router.get("/veo/status/:id", handleStatus);
-router.get("/video/status/:id", handleStatus);
-
-// Debug (optional)
-router.get("/debug/env", (_req, res) => {
-  res.json({
-    ok: true,
-    FLOW_BASE_URL,
-    FLOW_SESSION_VALIDATE_URL,
-    FLOW_VEO_GENERATE_URL,
-    FLOW_VEO_STATUS_URL,
-  });
 });
 
 export default router;
-export { router };
-
