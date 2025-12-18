@@ -1,301 +1,244 @@
+/**
+ * VictorSharp Labs Proxy - flowRoutes.js
+ *
+ * This file proxies Flow / Labs endpoints:
+ *  - POST /api/flow/session/validate  -> https://labs.google/fx/api/auth/session
+ *  - POST /api/flow/video/generate    -> https://labs.google/fx/api/video/generate
+ *  - GET  /api/flow/health            -> local health
+ *
+ * IMPORTANT:
+ * - /api/flow/session/validate is POST-only.
+ * - Client should send JSON body: { session: "<token_or_json>" }
+ */
+
 import express from "express";
 
 const router = express.Router();
 
-/**
- * ENV defaults (khớp đúng thứ bạn đang dùng)
- */
-const FLOW_SESSION_VALIDATE_URL =
-  process.env.FLOW_SESSION_VALIDATE_URL || "https://labs.google/fx/api/auth/session";
-
-const FLOW_VEO_GENERATE_URL =
-  process.env.FLOW_VEO_GENERATE_URL || "https://labs.google/fx/api/video/generate";
-
-const FLOW_VEO_STATUS_URL =
-  process.env.FLOW_VEO_STATUS_URL || "https://labs.google/fx/api/video/status";
-
-/**
- * Helpers
- */
-function safeJsonParse(maybeJson) {
-  try {
-    return JSON.parse(maybeJson);
-  } catch {
-    return null;
-  }
+// ---------- helpers ----------
+function safeTrim(v) {
+  return typeof v === "string" ? v.trim() : "";
 }
 
-function normalizeProxyBase(base) {
-  if (!base) return "";
-  let b = String(base).trim();
-  // remove trailing slashes
-  b = b.replace(/\/+$/, "");
-  return b;
+function isObject(x) {
+  return x && typeof x === "object" && !Array.isArray(x);
 }
 
 /**
- * Nhận session input dưới nhiều dạng:
- * - string "ya29...."
- * - JSON string {"access_token":"ya29...","expires":"..."}
- * - object {access_token:"ya29..."}
- * - object {session:{access_token:"ya29..."}} (một số app bọc thêm)
+ * Accepts session either:
+ * - string token (flow session)
+ * - object json (if user pasted raw json)
  */
-function extractAccessToken(sessionInput) {
-  if (!sessionInput) return "";
-
-  // If string => may be token or JSON string
-  if (typeof sessionInput === "string") {
-    const s = sessionInput.trim();
-    const parsed = safeJsonParse(s);
-    if (parsed && typeof parsed === "object") {
-      return (
-        parsed.access_token ||
-        parsed.token ||
-        parsed.accessToken ||
-        parsed?.session?.access_token ||
-        ""
-      );
-    }
-    return s; // treat as raw token
-  }
-
-  // If object
-  if (typeof sessionInput === "object") {
-    return (
-      sessionInput.access_token ||
-      sessionInput.token ||
-      sessionInput.accessToken ||
-      sessionInput?.session?.access_token ||
-      ""
-    );
-  }
-
+function normalizeSessionInput(session) {
+  if (typeof session === "string") return safeTrim(session);
+  if (isObject(session)) return session; // allow passing object
   return "";
 }
 
-async function forwardJson(url, { method = "POST", headers = {}, bodyObj }) {
-  const res = await fetch(url, {
-    method,
-    headers: {
-      "Content-Type": "application/json",
-      ...headers,
-    },
-    body: bodyObj ? JSON.stringify(bodyObj) : undefined,
-  });
+function jsonError(res, status, error, extra = {}) {
+  return res.status(status).json({ ok: false, error, ...extra });
+}
 
-  const text = await res.text();
-  let json = null;
+async function fetchWithTimeout(url, options = {}, timeoutMs = 45000) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeoutMs);
+
   try {
-    json = text ? JSON.parse(text) : null;
-  } catch {
-    json = null;
+    const resp = await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    });
+    return resp;
+  } finally {
+    clearTimeout(id);
   }
-
-  return { status: res.status, ok: res.ok, text, json };
 }
 
 /**
- * Convenience GETs (để bạn test trên browser cho đỡ hiểu nhầm)
- * - Browser GET vào /session/validate trước đây sẽ thấy "Not Found"
- * - Giờ sẽ thấy hướng dẫn rõ: phải POST
+ * A single place to call Labs.
+ * We forward UA + referer/origin to mimic browser requests better.
  */
-router.get("/session/validate", (_req, res) => {
-  res.status(200).json({
+async function callLabs(url, { method = "POST", headers = {}, body = null, timeoutMs = 45000 } = {}) {
+  const baseHeaders = {
+    "Content-Type": "application/json",
+    "Accept": "application/json, text/plain, */*",
+    // mimic browser-ish headers
+    "User-Agent":
+      headers["User-Agent"] ||
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari",
+    "Origin": headers["Origin"] || "https://labs.google",
+    "Referer": headers["Referer"] || "https://labs.google/fx/tools/",
+  };
+
+  // Merge (caller overrides)
+  const merged = { ...baseHeaders, ...headers };
+
+  const resp = await fetchWithTimeout(
+    url,
+    {
+      method,
+      headers: merged,
+      body: body ? JSON.stringify(body) : undefined,
+    },
+    timeoutMs
+  );
+
+  const contentType = resp.headers.get("content-type") || "";
+  let dataText = "";
+  let dataJson = null;
+
+  // try json first
+  if (contentType.includes("application/json")) {
+    try {
+      dataJson = await resp.json();
+    } catch (e) {
+      dataText = await resp.text().catch(() => "");
+    }
+  } else {
+    dataText = await resp.text().catch(() => "");
+    // sometimes returns json with wrong content-type
+    try {
+      dataJson = JSON.parse(dataText);
+    } catch (_) {
+      // ignore
+    }
+  }
+
+  return {
+    ok: resp.ok,
+    status: resp.status,
+    headers: Object.fromEntries(resp.headers.entries()),
+    json: dataJson,
+    text: dataText,
+  };
+}
+
+// ---------- routes ----------
+
+// quick health under /api/flow
+router.get("/health", (req, res) => {
+  res.status(200).json({ ok: true, route: "/api/flow/health", ts: Date.now() });
+});
+
+/**
+ * Validate Flow session (POST only)
+ * Body: { session: "<token>" } or { session: {...} }
+ */
+router.post("/session/validate", async (req, res) => {
+  try {
+    const session = normalizeSessionInput(req.body?.session);
+
+    if (!session || (typeof session === "string" && session.length < 10)) {
+      return jsonError(res, 400, "Missing or invalid session. Provide { session: <token or json> }");
+    }
+
+    console.log("[INCOMING] POST /api/flow/session/validate");
+    console.log("[FLOW_VALIDATE] -> https://labs.google/fx/api/auth/session");
+
+    const upstreamUrl = "https://labs.google/fx/api/auth/session";
+
+    // upstream expects JSON; for string session we send { session: "<token>" }
+    // for object session, pass it as-is (some users paste the raw json they copied)
+    const payload = typeof session === "string" ? { session } : session;
+
+    const upstream = await callLabs(upstreamUrl, {
+      method: "POST",
+      headers: {
+        // forward some headers if present
+        "User-Agent": req.headers["user-agent"] || undefined,
+        "Origin": req.headers["origin"] || undefined,
+        "Referer": req.headers["referer"] || undefined,
+      },
+      body: payload,
+      timeoutMs: Number(process.env.FLOW_VALIDATE_TIMEOUT_MS || 45000),
+    });
+
+    if (!upstream.ok) {
+      return res.status(200).json({
+        ok: false,
+        error: "Validate Session Failed",
+        upstream: upstreamUrl,
+        upstreamStatus: upstream.status,
+        upstreamBody: upstream.json ?? upstream.text ?? null,
+      });
+    }
+
+    return res.status(200).json({
+      ok: true,
+      upstream: upstreamUrl,
+      data: upstream.json ?? upstream.text ?? null,
+    });
+  } catch (err) {
+    const msg = err?.name === "AbortError" ? "Upstream timeout (AbortError)" : (err?.message || "Unknown error");
+    console.error("[FLOW_VALIDATE_ERROR]", err);
+    return res.status(200).json({
+      ok: false,
+      error: msg,
+    });
+  }
+});
+
+/**
+ * Generate video (POST)
+ * Body: { session: "<token>", ...payload }
+ *
+ * We forward the entire body to labs, but ensure session exists.
+ */
+router.post("/video/generate", async (req, res) => {
+  try {
+    const session = normalizeSessionInput(req.body?.session);
+    if (!session || (typeof session === "string" && session.length < 10)) {
+      return jsonError(res, 400, "Missing or invalid session. Provide session in request body.");
+    }
+
+    console.log("[INCOMING] POST /api/flow/video/generate");
+    console.log("[FLOW_GENERATE] -> https://labs.google/fx/api/video/generate");
+
+    const upstreamUrl = "https://labs.google/fx/api/video/generate";
+
+    // Forward full payload
+    const payload = { ...req.body, session: typeof session === "string" ? session : req.body.session };
+
+    const upstream = await callLabs(upstreamUrl, {
+      method: "POST",
+      headers: {
+        "User-Agent": req.headers["user-agent"] || undefined,
+        "Origin": req.headers["origin"] || undefined,
+        "Referer": req.headers["referer"] || undefined,
+      },
+      body: payload,
+      timeoutMs: Number(process.env.FLOW_GENERATE_TIMEOUT_MS || 90000),
+    });
+
+    if (!upstream.ok) {
+      return res.status(200).json({
+        ok: false,
+        error: "Create Job Failed",
+        upstream: upstreamUrl,
+        upstreamStatus: upstream.status,
+        upstreamBody: upstream.json ?? upstream.text ?? null,
+      });
+    }
+
+    return res.status(200).json({
+      ok: true,
+      upstream: upstreamUrl,
+      data: upstream.json ?? upstream.text ?? null,
+    });
+  } catch (err) {
+    const msg = err?.name === "AbortError" ? "Upstream timeout (AbortError)" : (err?.message || "Unknown error");
+    console.error("[FLOW_GENERATE_ERROR]", err);
+    return res.status(200).json({ ok: false, error: msg });
+  }
+});
+
+// GET is not allowed for validate (helpful hint)
+router.get("/session/validate", (req, res) => {
+  res.status(405).json({
     ok: false,
     error: "Method Not Allowed",
     hint: "Use POST /api/flow/session/validate with JSON body { session: <token or json> }",
   });
-});
-
-router.get("/video/generate", (_req, res) => {
-  res.status(200).json({
-    ok: false,
-    error: "Method Not Allowed",
-    hint: "Use POST /api/flow/video/generate",
-  });
-});
-
-router.get("/video/status", (_req, res) => {
-  res.status(200).json({
-    ok: false,
-    error: "Method Not Allowed",
-    hint: "Use POST /api/flow/video/status",
-  });
-});
-
-/**
- * 1) Validate Session
- * POST /api/flow/session/validate
- * Body supported:
- *  - { session: "ya29..." }
- *  - { session: {"access_token":"ya29...","expires":"..."} }
- *  - { access_token: "ya29..." }  (lỡ app gửi thẳng)
- */
-router.post("/session/validate", async (req, res) => {
-  try {
-    const sessionInput = req.body?.session ?? req.body ?? null;
-    const accessToken = extractAccessToken(sessionInput);
-
-    if (!accessToken) {
-      return res.status(400).json({
-        ok: false,
-        error: "Missing Flow session token",
-        hint: "Send { session: <token or json> }",
-      });
-    }
-
-    console.log(`[FLOW_VALIDATE] -> ${FLOW_SESSION_VALIDATE_URL}`);
-
-    const upstream = await forwardJson(FLOW_SESSION_VALIDATE_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-      },
-      // Nhiều endpoint validate chỉ cần Bearer là đủ,
-      // nhưng gửi thêm token trong body cũng không hại.
-      bodyObj: { access_token: accessToken },
-    });
-
-    if (!upstream.ok) {
-      return res.status(502).json({
-        ok: false,
-        error: "Validate Session Failed",
-        upstream: FLOW_SESSION_VALIDATE_URL,
-        upstreamStatus: upstream.status,
-        upstreamBody: upstream.text,
-      });
-    }
-
-    // Return JSON nếu upstream trả JSON, không thì trả text
-    return res.status(200).json({
-      ok: true,
-      upstreamStatus: upstream.status,
-      data: upstream.json ?? upstream.text,
-    });
-  } catch (err) {
-    return res.status(500).json({
-      ok: false,
-      error: "Proxy Error (validate)",
-      details: String(err?.message || err),
-    });
-  }
-});
-
-/**
- * 2) Create Video Job
- * POST /api/flow/video/generate
- * Body recommended:
- *  {
- *    session: <token or json>,
- *    payload: { ... }   // payload gửi lên labs
- *  }
- * (Nếu app gửi thẳng body là payload thì cũng OK, miễn có session ở đâu đó)
- */
-router.post("/video/generate", async (req, res) => {
-  try {
-    const sessionInput = req.body?.session ?? req.body?.auth ?? req.body?.flowSession ?? null;
-    const accessToken = extractAccessToken(sessionInput);
-
-    if (!accessToken) {
-      return res.status(400).json({
-        ok: false,
-        error: "Missing Flow session token",
-        hint: "Send { session: <token or json>, payload: {...} }",
-      });
-    }
-
-    const payload = req.body?.payload ?? req.body?.data ?? req.body ?? {};
-
-    console.log(`[FLOW_GENERATE] -> ${FLOW_VEO_GENERATE_URL}`);
-
-    const upstream = await forwardJson(FLOW_VEO_GENERATE_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-      },
-      bodyObj: payload,
-    });
-
-    if (!upstream.ok) {
-      return res.status(502).json({
-        ok: false,
-        error: "Create Job Failed",
-        upstream: FLOW_VEO_GENERATE_URL,
-        upstreamStatus: upstream.status,
-        upstreamBody: upstream.text,
-      });
-    }
-
-    return res.status(200).json({
-      ok: true,
-      upstreamStatus: upstream.status,
-      data: upstream.json ?? upstream.text,
-    });
-  } catch (err) {
-    return res.status(500).json({
-      ok: false,
-      error: "Proxy Error (generate)",
-      details: String(err?.message || err),
-    });
-  }
-});
-
-/**
- * 3) Check Status
- * POST /api/flow/video/status
- * Body recommended:
- *  {
- *    session: <token or json>,
- *    jobId: "xxxx"  (hoặc payload tùy labs)
- *  }
- */
-router.post("/video/status", async (req, res) => {
-  try {
-    const sessionInput = req.body?.session ?? req.body?.auth ?? req.body?.flowSession ?? null;
-    const accessToken = extractAccessToken(sessionInput);
-
-    if (!accessToken) {
-      return res.status(400).json({
-        ok: false,
-        error: "Missing Flow session token",
-        hint: "Send { session: <token or json>, jobId: '...' }",
-      });
-    }
-
-    const payload = req.body?.payload ?? req.body ?? {};
-
-    console.log(`[FLOW_STATUS] -> ${FLOW_VEO_STATUS_URL}`);
-
-    const upstream = await forwardJson(FLOW_VEO_STATUS_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-      },
-      bodyObj: payload,
-    });
-
-    if (!upstream.ok) {
-      return res.status(502).json({
-        ok: false,
-        error: "Status Check Failed",
-        upstream: FLOW_VEO_STATUS_URL,
-        upstreamStatus: upstream.status,
-        upstreamBody: upstream.text,
-      });
-    }
-
-    return res.status(200).json({
-      ok: true,
-      upstreamStatus: upstream.status,
-      data: upstream.json ?? upstream.text,
-    });
-  } catch (err) {
-    return res.status(500).json({
-      ok: false,
-      error: "Proxy Error (status)",
-      details: String(err?.message || err),
-    });
-  }
 });
 
 export default router;
