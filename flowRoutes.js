@@ -1,256 +1,263 @@
 // flowRoutes.js (ESM)
+// Routes:
+//   GET/POST /api/flow/session/validate
+//   POST     /api/flow/video/generate
+//   GET      /api/flow/video/status/:id
+//
+// Upstream defaults can be overridden by Render ENV:
+//   FLOW_BASE_URL
+//   FLOW_SESSION_VALIDATE_URL
+//   FLOW_VEO_GENERATE_URL
+//   FLOW_VEO_STATUS_URL
+
 import express from "express";
 
 const router = express.Router();
 
-// Endpoint Google Labs
-const LABS_SESSION_URL = "https://labs.google/fx/api/auth/session";
+const FLOW_BASE_URL = (process.env.FLOW_BASE_URL || "https://labs.google").replace(/\/+$/, "");
 
-// -----------------------------
-// Helpers
-// -----------------------------
-function isJsonLikeString(s) {
-  if (typeof s !== "string") return false;
-  const t = s.trim();
-  return (
-    (t.startsWith("{") && t.endsWith("}")) || (t.startsWith("[") && t.endsWith("]"))
-  );
+const FLOW_SESSION_VALIDATE_URL = (
+  process.env.FLOW_SESSION_VALIDATE_URL || `${FLOW_BASE_URL}/fx/api/auth/session`
+).replace(/\/+$/, "");
+
+// NOTE: if Google changes endpoint, just override env FLOW_VEO_GENERATE_URL on Render
+const FLOW_VEO_GENERATE_URL = (
+  process.env.FLOW_VEO_GENERATE_URL || `${FLOW_BASE_URL}/fx/api/video/generate`
+).replace(/\/+$/, "");
+
+const FLOW_VEO_STATUS_URL = (
+  process.env.FLOW_VEO_STATUS_URL || `${FLOW_BASE_URL}/fx/api/video/status`
+).replace(/\/+$/, "");
+
+function safeSnippet(v, max = 1200) {
+  if (v == null) return "";
+  const s = typeof v === "string" ? v : JSON.stringify(v);
+  return s.length > max ? s.slice(0, max) + "..." : s;
 }
 
-function safeJsonParse(s) {
-  try {
-    return JSON.parse(s);
-  } catch {
-    return null;
-  }
+// ✅ “cách 1” bạn chọn: dán CHỈ token ya29... vào app
+// -> backend nhận token từ Authorization OR body.session OR body.access_token OR header x-flow-session/x-flow-token
+function pickBearer(req) {
+  const auth = req.headers.authorization;
+  if (typeof auth === "string" && auth.toLowerCase().startsWith("bearer ")) return auth.trim();
+
+  const h1 = req.headers["x-flow-session"];
+  const h2 = req.headers["x-flow-token"];
+  const ht = (typeof h1 === "string" && h1.trim()) ? h1.trim() : (typeof h2 === "string" && h2.trim() ? h2.trim() : "");
+
+  const bodyToken =
+    (typeof req.body?.session === "string" && req.body.session.trim()) ? req.body.session.trim() :
+    (typeof req.body?.access_token === "string" && req.body.access_token.trim()) ? req.body.access_token.trim() :
+    (typeof req.body?.token === "string" && req.body.token.trim()) ? req.body.token.trim() :
+    "";
+
+  const token = ht || bodyToken;
+  if (!token) return "";
+
+  // allow user to paste "Bearer ya29..." or just "ya29..."
+  return token.toLowerCase().startsWith("bearer ") ? token : `Bearer ${token}`;
 }
 
-/**
- * Accepts:
- * - string token (ya29....) OR "Bearer ya29..."
- * - JSON string ( {"access_token":"..."} or {"token":"..."} or any object)
- * - object
- */
-function normalizeSessionInput(body) {
-  let raw = body;
-
-  // preferred: { session: ... }
-  if (raw && typeof raw === "object" && raw.session !== undefined) raw = raw.session;
-
-  // if string json -> parse
-  if (isJsonLikeString(raw)) {
-    const parsed = safeJsonParse(raw);
-    if (parsed !== null) raw = parsed;
-  }
-
-  let token = null;
-
-  if (typeof raw === "string") {
-    const t = raw.trim();
-    // allow user paste "Bearer xxx"
-    token = t.toLowerCase().startsWith("bearer ") ? t.slice(7).trim() : t;
-  }
-
-  if (raw && typeof raw === "object") {
-    token =
-      raw.access_token ||
-      raw.token ||
-      raw.session ||
-      raw.value ||
-      null;
-  }
-
-  return { raw, token };
-}
-
-async function readUpstream(resp) {
+async function readUpstreamBody(resp) {
   const text = await resp.text();
-  let data = null;
   try {
-    data = JSON.parse(text);
+    return { kind: "json", data: JSON.parse(text) };
   } catch {
-    data = null;
-  }
-  return {
-    status: resp.status,
-    ok: resp.ok,
-    contentType: resp.headers.get("content-type") || "",
-    // keep short snippet for debugging
-    textSnippet: text?.slice(0, 500),
-    data,
-  };
-}
-
-async function fetchWithTimeout(url, init, timeoutMs = 25000) {
-  const controller = new AbortController();
-  const id = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const resp = await fetch(url, { ...init, signal: controller.signal });
-    return resp;
-  } finally {
-    clearTimeout(id);
+    return { kind: "text", data: text };
   }
 }
 
-/**
- * Multi-strategy:
- * 1) GET with Authorization Bearer <token>  (thường đúng nhất để đọc session hiện tại)
- * 2) POST empty body + Authorization (fallback)
- * 3) POST JSON {session: raw} (last resort - một số proxy custom dùng kiểu này)
- */
-async function forwardToLabsSession({ raw, token }) {
-  const headersBase = {
-    Accept: "application/json, text/plain, */*",
-    "User-Agent": "victorsharp-labs-proxy/1.0",
-  };
-
-  const authHeaders =
-    typeof token === "string" && token.length > 20
-      ? { Authorization: `Bearer ${token}` }
-      : {};
-
-  const attempts = [];
-
-  // Strategy 1: GET + Bearer
+function log(tag, obj) {
   try {
-    const resp = await fetchWithTimeout(
-      LABS_SESSION_URL,
-      {
-        method: "GET",
-        headers: { ...headersBase, ...authHeaders },
-      },
-      25000
-    );
-    const out = await readUpstream(resp);
-    attempts.push({ strategy: "GET_BEARER", ...out });
-    if (out.ok) return { picked: "GET_BEARER", out, attempts };
-  } catch (e) {
-    attempts.push({
-      strategy: "GET_BEARER",
-      ok: false,
-      status: 0,
-      error: e?.name === "AbortError" ? "UPSTREAM_TIMEOUT" : (e?.message || String(e)),
-    });
-  }
-
-  // Strategy 2: POST (no body) + Bearer
-  try {
-    const resp = await fetchWithTimeout(
-      LABS_SESSION_URL,
-      {
-        method: "POST",
-        headers: {
-          ...headersBase,
-          ...authHeaders,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({}),
-      },
-      25000
-    );
-    const out = await readUpstream(resp);
-    attempts.push({ strategy: "POST_EMPTY_JSON", ...out });
-    if (out.ok) return { picked: "POST_EMPTY_JSON", out, attempts };
-  } catch (e) {
-    attempts.push({
-      strategy: "POST_EMPTY_JSON",
-      ok: false,
-      status: 0,
-      error: e?.name === "AbortError" ? "UPSTREAM_TIMEOUT" : (e?.message || String(e)),
-    });
-  }
-
-  // Strategy 3: POST {session: raw} (last resort)
-  try {
-    const resp = await fetchWithTimeout(
-      LABS_SESSION_URL,
-      {
-        method: "POST",
-        headers: {
-          ...headersBase,
-          ...authHeaders,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ session: raw }),
-      },
-      25000
-    );
-    const out = await readUpstream(resp);
-    attempts.push({ strategy: "POST_SESSION_WRAPPER", ...out });
-    return { picked: "POST_SESSION_WRAPPER", out, attempts };
-  } catch (e) {
-    attempts.push({
-      strategy: "POST_SESSION_WRAPPER",
-      ok: false,
-      status: 0,
-      error: e?.name === "AbortError" ? "UPSTREAM_TIMEOUT" : (e?.message || String(e)),
-    });
-    return { picked: "POST_SESSION_WRAPPER", out: null, attempts };
+    console.log(`[${tag}]`, JSON.stringify(obj));
+  } catch {
+    console.log(`[${tag}]`, obj);
   }
 }
 
-// -----------------------------
-// Routes
-// -----------------------------
-router.get("/health", (_req, res) => {
-  res.json({ ok: true, scope: "flow", ts: Date.now() });
-});
+// ---------- SESSION VALIDATE (support BOTH GET + POST to avoid mismatch) ----------
+async function validateHandler(req, res) {
+  const bearer = pickBearer(req);
 
-router.get("/session/validate", (_req, res) => {
-  res.status(405).json({
-    ok: false,
-    error: "Method Not Allowed",
-    hint: "Use POST /api/flow/session/validate with JSON body { session: <token or json> }",
+  log("FLOW_VALIDATE", {
+    method: req.method,
+    path: req.path,
+    hasAuth: !!bearer,
+    upstream: FLOW_SESSION_VALIDATE_URL,
   });
-});
 
-router.post("/session/validate", async (req, res) => {
+  if (!bearer) {
+    return res.status(401).json({
+      ok: false,
+      error: "Missing token. Provide Authorization: Bearer <ya29...> (or body.session).",
+    });
+  }
+
   try {
-    const normalized = normalizeSessionInput(req.body);
+    const upstreamRes = await fetch(FLOW_SESSION_VALIDATE_URL, {
+      method: "GET",
+      headers: {
+        Authorization: bearer,
+        Accept: "application/json,text/plain,*/*",
+      },
+    });
 
-    if (!normalized.raw) {
-      return res.status(400).json({
+    const body = await readUpstreamBody(upstreamRes);
+
+    if (!upstreamRes.ok) {
+      return res.status(upstreamRes.status).json({
         ok: false,
-        error: "Missing session",
-        hint: "POST JSON: { session: <token or json> }",
+        error: "Session validate failed",
+        upstream: FLOW_SESSION_VALIDATE_URL,
+        upstreamStatus: upstreamRes.status,
+        upstreamBody: body.kind === "json" ? body.data : safeSnippet(body.data, 4000),
       });
     }
 
-    console.log("[FLOW_VALIDATE] ->", LABS_SESSION_URL);
-
-    const result = await forwardToLabsSession(normalized);
-
-    // If we got an upstream response, pass-through its status
-    if (result?.out) {
-      const upstream = result.out;
-
-      return res.status(upstream.status).json({
-        ok: upstream.ok,
-        upstreamStatus: upstream.status,
-        picked: result.picked,
-        // if JSON, return json; else return snippet
-        data: upstream.data ?? { raw: upstream.textSnippet },
-        debug: {
-          attempts: result.attempts,
-        },
-      });
-    }
-
-    // No upstream response (network/timeout)
+    return res.status(200).json({
+      ok: true,
+      upstream: FLOW_SESSION_VALIDATE_URL,
+      data: body.kind === "json" ? body.data : body.data,
+    });
+  } catch (err) {
     return res.status(502).json({
       ok: false,
-      error: "Bad Gateway",
-      message: "No upstream response",
-      debug: { attempts: result?.attempts || [] },
-    });
-  } catch (e) {
-    console.error("[FLOW_VALIDATE_ERROR]", e);
-    return res.status(500).json({
-      ok: false,
-      error: "Validate failed",
-      message: e?.message || String(e),
+      error: "Session validate failed (proxy fetch error)",
+      upstream: FLOW_SESSION_VALIDATE_URL,
+      detail: String(err?.message || err),
     });
   }
+}
+
+router.get("/session/validate", validateHandler);
+router.post("/session/validate", validateHandler);
+
+// ---------- VIDEO GENERATE ----------
+router.post("/video/generate", async (req, res) => {
+  const bearer = pickBearer(req);
+  const payload = req.body || {};
+
+  log("FLOW_GENERATE", {
+    path: req.path,
+    hasAuth: !!bearer,
+    upstream: FLOW_VEO_GENERATE_URL,
+    keys: Object.keys(payload || {}),
+    promptPreview: safeSnippet(payload?.prompt || payload?.text || "", 120),
+  });
+
+  if (!bearer) {
+    return res.status(401).json({
+      ok: false,
+      error: "Missing token. Provide Authorization: Bearer <ya29...> (or body.session).",
+    });
+  }
+
+  if (!payload || typeof payload !== "object") {
+    return res.status(400).json({ ok: false, error: "Missing/invalid JSON body" });
+  }
+
+  try {
+    const upstreamRes = await fetch(FLOW_VEO_GENERATE_URL, {
+      method: "POST",
+      headers: {
+        Authorization: bearer,
+        "Content-Type": "application/json",
+        Accept: "application/json,text/plain,*/*",
+      },
+      body: JSON.stringify(payload),
+    });
+
+    const body = await readUpstreamBody(upstreamRes);
+
+    if (!upstreamRes.ok) {
+      return res.status(upstreamRes.status).json({
+        ok: false,
+        error: `Create Job Failed (${upstreamRes.status})`,
+        upstream: FLOW_VEO_GENERATE_URL,
+        upstreamStatus: upstreamRes.status,
+        upstreamBody: body.kind === "json" ? body.data : safeSnippet(body.data, 4000),
+      });
+    }
+
+    return res.status(200).json({
+      ok: true,
+      upstream: FLOW_VEO_GENERATE_URL,
+      data: body.kind === "json" ? body.data : body.data,
+    });
+  } catch (err) {
+    return res.status(502).json({
+      ok: false,
+      error: "Flow generate failed (proxy fetch error)",
+      upstream: FLOW_VEO_GENERATE_URL,
+      detail: String(err?.message || err),
+    });
+  }
+});
+
+// ---------- VIDEO STATUS ----------
+router.get("/video/status/:id", async (req, res) => {
+  const bearer = pickBearer(req);
+  const id = req.params.id;
+  const upstreamUrl = `${FLOW_VEO_STATUS_URL}/${encodeURIComponent(id)}`;
+
+  log("FLOW_STATUS", {
+    path: req.path,
+    hasAuth: !!bearer,
+    upstream: upstreamUrl,
+  });
+
+  if (!bearer) {
+    return res.status(401).json({
+      ok: false,
+      error: "Missing token. Provide Authorization: Bearer <ya29...> (or body.session).",
+    });
+  }
+
+  try {
+    const upstreamRes = await fetch(upstreamUrl, {
+      method: "GET",
+      headers: {
+        Authorization: bearer,
+        Accept: "application/json,text/plain,*/*",
+      },
+    });
+
+    const body = await readUpstreamBody(upstreamRes);
+
+    if (!upstreamRes.ok) {
+      return res.status(upstreamRes.status).json({
+        ok: false,
+        error: `Status Failed (${upstreamRes.status})`,
+        upstream: upstreamUrl,
+        upstreamStatus: upstreamRes.status,
+        upstreamBody: body.kind === "json" ? body.data : safeSnippet(body.data, 4000),
+      });
+    }
+
+    return res.status(200).json({
+      ok: true,
+      upstream: upstreamUrl,
+      data: body.kind === "json" ? body.data : body.data,
+    });
+  } catch (err) {
+    return res.status(502).json({
+      ok: false,
+      error: "Flow status failed (proxy fetch error)",
+      upstream: upstreamUrl,
+      detail: String(err?.message || err),
+    });
+  }
+});
+
+// debug (optional)
+router.get("/debug/env", (_req, res) => {
+  res.json({
+    ok: true,
+    FLOW_BASE_URL,
+    FLOW_SESSION_VALIDATE_URL,
+    FLOW_VEO_GENERATE_URL,
+    FLOW_VEO_STATUS_URL,
+  });
 });
 
 export default router;
