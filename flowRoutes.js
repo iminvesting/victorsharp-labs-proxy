@@ -1,241 +1,262 @@
-/**
- * flowRoutes.js - mounted at /api/flow
- *
- * Routes:
- *   POST /session/validate
- *   POST /video/generate
- *
- * Upstream:
- *   GET  https://labs.google/fx/api/auth/session
- *   POST https://labs.google/fx/api/video/generate
- */
+// flowRoutes.js (ESM) — VictorSharp Flow Veo3 Proxy Routes
+// Supports:
+//   POST /api/flow/session/validate
+//   POST /api/flow/veo/generate      + /api/flow/video/generate
+//   GET  /api/flow/veo/status/:id    + /api/flow/video/status/:id
+//
+// Node 18+ has global fetch (Render Node 22+ OK)
 
-const express = require("express");
+import express from "express";
+
 const router = express.Router();
 
-const UPSTREAM_AUTH_SESSION = "https://labs.google/fx/api/auth/session";
-const UPSTREAM_VIDEO_GENERATE = "https://labs.google/fx/api/video/generate";
+/** =========================
+ *  Upstream config (override via Render ENV)
+ *  ========================= */
+const FLOW_BASE_URL = (process.env.FLOW_BASE_URL || "https://labs.google").replace(/\/+$/, "");
 
-// -------------------------
-// Helpers
-// -------------------------
-function safeJsonParse(str) {
+// Session validate endpoint (GET)
+const FLOW_SESSION_VALIDATE_URL =
+  (process.env.FLOW_SESSION_VALIDATE_URL || `${FLOW_BASE_URL}/fx/api/auth/session`).replace(/\/+$/, "");
+
+// Generate endpoint (POST)
+const FLOW_VEO_GENERATE_URL =
+  (process.env.FLOW_VEO_GENERATE_URL || `${FLOW_BASE_URL}/fx/api/video/generate`).replace(/\/+$/, "");
+
+// Status endpoint prefix (GET {prefix}/{id})
+const FLOW_VEO_STATUS_URL =
+  (process.env.FLOW_VEO_STATUS_URL || `${FLOW_BASE_URL}/fx/api/video/status`).replace(/\/+$/, "");
+
+/** =========================
+ * Helpers
+ * ========================= */
+function safeSnippet(v, max = 1200) {
+  if (v == null) return "";
+  const s = typeof v === "string" ? v : JSON.stringify(v);
+  return s.length > max ? s.slice(0, max) + "..." : s;
+}
+
+function pickBearer(req) {
+  const auth = req.headers.authorization || "";
+  if (typeof auth === "string" && auth.toLowerCase().startsWith("bearer ")) {
+    return auth.trim(); // keep "Bearer xxx"
+  }
+  // fallback: accept token in body for convenience
+  const t = req.body?.access_token || req.body?.token || req.body?.session;
+  if (t && typeof t === "string" && t.trim()) return `Bearer ${t.trim()}`;
+  return "";
+}
+
+async function readUpstreamBody(resp) {
+  const text = await resp.text();
   try {
-    return JSON.parse(str);
+    return { kind: "json", data: JSON.parse(text) };
   } catch {
-    return null;
+    return { kind: "text", data: text };
   }
 }
 
-/**
- * Normalize user input -> cookie header
- * Accepts:
- *  - raw token: "ya29..." OR just token string
- *  - cookie string: "__Secure-next-auth.session-token=...; other=..."
- *  - JSON string/object: tries to find cookie/token fields
- */
-function normalizeSessionToCookie(sessionInput) {
-  if (!sessionInput) return "";
-
-  // object
-  if (typeof sessionInput === "object") {
-    const obj = sessionInput;
-
-    const cookie =
-      obj.cookie ||
-      obj.cookies ||
-      obj.Cookie ||
-      obj.sessionCookie ||
-      obj.session_cookie ||
-      obj.sessionTokenCookie;
-
-    if (typeof cookie === "string" && cookie.includes("=")) return cookie;
-
-    const token =
-      obj.token ||
-      obj.session ||
-      obj.sessionToken ||
-      obj.session_token ||
-      obj.nextAuthSessionToken ||
-      obj.next_auth_session_token;
-
-    if (typeof token === "string" && token.trim()) {
-      return `__Secure-next-auth.session-token=${token.trim()}`;
-    }
-
-    // fallback: find any string containing "="
-    for (const k of Object.keys(obj)) {
-      const v = obj[k];
-      if (typeof v === "string" && v.includes("=")) return v;
-    }
-    return "";
-  }
-
-  // string
-  const s = String(sessionInput).trim();
-  if (!s) return "";
-
-  // JSON string?
-  if ((s.startsWith("{") && s.endsWith("}")) || (s.startsWith("[") && s.endsWith("]"))) {
-    const parsed = safeJsonParse(s);
-    if (parsed) return normalizeSessionToCookie(parsed);
-  }
-
-  // cookie string?
-  if (s.includes("=")) return s;
-
-  // raw token
-  return `__Secure-next-auth.session-token=${s}`;
-}
-
-function buildUpstreamHeaders(cookieHeader) {
-  const h = {
-    accept: "application/json, text/plain, */*",
-    "content-type": "application/json",
-    origin: "https://labs.google",
-    referer: "https://labs.google/fx/",
-    "user-agent":
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-  };
-  if (cookieHeader) h.cookie = cookieHeader;
-  return h;
-}
-
-async function fetchWithTimeout(url, options = {}, timeoutMs = 45000) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+function log(tag, obj) {
   try {
-    const res = await fetch(url, { ...options, signal: controller.signal });
-    return res;
-  } finally {
-    clearTimeout(timer);
+    console.log(`[${tag}]`, JSON.stringify(obj));
+  } catch {
+    console.log(`[${tag}]`, obj);
   }
 }
 
-async function readUpstream(res) {
-  const ct = res.headers.get("content-type") || "";
-  if (ct.includes("application/json")) {
-    try {
-      return await res.json();
-    } catch {
-      return { ok: false, error: "Upstream returned invalid JSON" };
-    }
-  }
-  return await res.text();
-}
-
-// -------------------------
-// Routes
-// -------------------------
-
-// GET for human testing -> hint
-router.get("/session/validate", (req, res) => {
-  res.status(405).json({
-    ok: false,
-    error: "Method Not Allowed",
-    hint: "Use POST /api/flow/session/validate with JSON body: { session: <token|cookie|json> }",
-  });
-});
-
-// POST validate
+/** =========================
+ * POST /api/flow/session/validate
+ * Header: Authorization: Bearer <token>
+ * ========================= */
 router.post("/session/validate", async (req, res) => {
-  try {
-    const sessionInput =
-      (req.body && (req.body.session || req.body.token || req.body.flowKey)) ||
-      req.headers["x-flow-session"] ||
-      req.headers["x-flow-token"] ||
-      req.headers["x-flow-cookie"];
+  const bearer = pickBearer(req);
 
-    const cookieHeader = normalizeSessionToCookie(sessionInput);
-    if (!cookieHeader) {
-      return res.status(400).json({
+  log("FLOW_VALIDATE", {
+    path: req.path,
+    hasAuth: !!bearer,
+    upstream: FLOW_SESSION_VALIDATE_URL,
+  });
+
+  if (!bearer) {
+    return res.status(401).json({
+      ok: false,
+      error: "Missing Authorization header. Expected: Bearer <token>",
+    });
+  }
+
+  try {
+    const upstreamRes = await fetch(FLOW_SESSION_VALIDATE_URL, {
+      method: "GET",
+      headers: {
+        Authorization: bearer,
+        Accept: "application/json,text/plain,*/*",
+      },
+    });
+
+    const body = await readUpstreamBody(upstreamRes);
+
+    if (!upstreamRes.ok) {
+      return res.status(upstreamRes.status).json({
         ok: false,
-        error: "Missing session",
-        hint: "Send JSON { session: <token or cookie> }",
+        error: "Session validate failed",
+        upstream: FLOW_SESSION_VALIDATE_URL,
+        upstreamStatus: upstreamRes.status,
+        upstreamBody: body.kind === "json" ? body.data : safeSnippet(body.data, 4000),
       });
     }
 
-    console.log(`[FLOW_VALIDATE] -> ${UPSTREAM_AUTH_SESSION}`);
-
-    const upstreamRes = await fetchWithTimeout(
-      UPSTREAM_AUTH_SESSION,
-      { method: "GET", headers: buildUpstreamHeaders(cookieHeader) },
-      30000
-    );
-
-    const upstreamBody = await readUpstream(upstreamRes);
-
-    return res.status(upstreamRes.ok ? 200 : 401).json({
-      ok: upstreamRes.ok,
-      status: upstreamRes.status,
-      upstream: UPSTREAM_AUTH_SESSION,
-      upstreamBody,
+    return res.status(200).json({
+      ok: true,
+      upstream: FLOW_SESSION_VALIDATE_URL,
+      data: body.kind === "json" ? body.data : body.data,
     });
-  } catch (e) {
-    const msg = e?.name === "AbortError" ? "Upstream timeout (AbortError)" : e?.message || "Validate failed";
-    console.error("[FLOW_VALIDATE_ERROR]", e);
-    return res.status(500).json({ ok: false, error: msg, upstream: UPSTREAM_AUTH_SESSION });
+  } catch (err) {
+    return res.status(502).json({
+      ok: false,
+      error: "Session validate failed (proxy fetch error)",
+      upstream: FLOW_SESSION_VALIDATE_URL,
+      detail: String(err?.message || err),
+    });
   }
 });
 
-// GET for human testing -> hint
-router.get("/video/generate", (req, res) => {
-  res.status(405).json({
-    ok: false,
-    error: "Method Not Allowed",
-    hint: "Use POST /api/flow/video/generate with JSON body + { session }",
+/** =========================
+ * POST /api/flow/veo/generate  (alias: /video/generate)
+ * Body: JSON payload from WebApp
+ * ========================= */
+async function handleGenerate(req, res) {
+  const bearer = pickBearer(req);
+  const payload = req.body || {};
+
+  log("FLOW_GENERATE", {
+    path: req.path,
+    hasAuth: !!bearer,
+    upstream: FLOW_VEO_GENERATE_URL,
+    promptPreview: safeSnippet(payload?.prompt || "", 120),
+  });
+
+  if (!bearer) {
+    return res.status(401).json({
+      ok: false,
+      error: "Missing Authorization header. Expected: Bearer <token>",
+    });
+  }
+
+  if (!payload || typeof payload !== "object") {
+    return res.status(400).json({ ok: false, error: "Missing/invalid JSON body" });
+  }
+
+  try {
+    const upstreamRes = await fetch(FLOW_VEO_GENERATE_URL, {
+      method: "POST",
+      headers: {
+        Authorization: bearer,
+        "Content-Type": "application/json",
+        Accept: "application/json,text/plain,*/*",
+      },
+      body: JSON.stringify(payload),
+    });
+
+    const body = await readUpstreamBody(upstreamRes);
+
+    if (!upstreamRes.ok) {
+      return res.status(upstreamRes.status).json({
+        ok: false,
+        error: `Create Job Failed (${upstreamRes.status})`,
+        upstream: FLOW_VEO_GENERATE_URL,
+        upstreamStatus: upstreamRes.status,
+        upstreamBody: body.kind === "json" ? body.data : safeSnippet(body.data, 4000),
+      });
+    }
+
+    return res.status(200).json({
+      ok: true,
+      upstream: FLOW_VEO_GENERATE_URL,
+      data: body.kind === "json" ? body.data : body.data,
+    });
+  } catch (err) {
+    return res.status(502).json({
+      ok: false,
+      error: "Flow generate failed (proxy fetch error)",
+      upstream: FLOW_VEO_GENERATE_URL,
+      detail: String(err?.message || err),
+    });
+  }
+}
+
+router.post("/veo/generate", handleGenerate);
+router.post("/video/generate", handleGenerate);
+
+/** =========================
+ * GET /api/flow/veo/status/:id  (alias: /video/status/:id)
+ * ========================= */
+async function handleStatus(req, res) {
+  const bearer = pickBearer(req);
+  const id = req.params.id;
+
+  const upstreamUrl = `${FLOW_VEO_STATUS_URL}/${encodeURIComponent(id)}`;
+
+  log("FLOW_STATUS", {
+    path: req.path,
+    hasAuth: !!bearer,
+    upstream: upstreamUrl,
+  });
+
+  if (!bearer) {
+    return res.status(401).json({
+      ok: false,
+      error: "Missing Authorization header. Expected: Bearer <token>",
+    });
+  }
+
+  try {
+    const upstreamRes = await fetch(upstreamUrl, {
+      method: "GET",
+      headers: {
+        Authorization: bearer,
+        Accept: "application/json,text/plain,*/*",
+      },
+    });
+
+    const body = await readUpstreamBody(upstreamRes);
+
+    if (!upstreamRes.ok) {
+      return res.status(upstreamRes.status).json({
+        ok: false,
+        error: `Status Failed (${upstreamRes.status})`,
+        upstream: upstreamUrl,
+        upstreamStatus: upstreamRes.status,
+        upstreamBody: body.kind === "json" ? body.data : safeSnippet(body.data, 4000),
+      });
+    }
+
+    return res.status(200).json({
+      ok: true,
+      upstream: upstreamUrl,
+      data: body.kind === "json" ? body.data : body.data,
+    });
+  } catch (err) {
+    return res.status(502).json({
+      ok: false,
+      error: "Flow status failed (proxy fetch error)",
+      upstream: upstreamUrl,
+      detail: String(err?.message || err),
+    });
+  }
+}
+
+router.get("/veo/status/:id", handleStatus);
+router.get("/video/status/:id", handleStatus);
+
+// Debug (optional)
+router.get("/debug/env", (_req, res) => {
+  res.json({
+    ok: true,
+    FLOW_BASE_URL,
+    FLOW_SESSION_VALIDATE_URL,
+    FLOW_VEO_GENERATE_URL,
+    FLOW_VEO_STATUS_URL,
   });
 });
 
-// POST generate
-router.post("/video/generate", async (req, res) => {
-  try {
-    const sessionInput =
-      (req.body && (req.body.session || req.body.token || req.body.flowKey)) ||
-      req.headers["x-flow-session"] ||
-      req.headers["x-flow-token"] ||
-      req.headers["x-flow-cookie"];
-
-    const cookieHeader = normalizeSessionToCookie(sessionInput);
-    if (!cookieHeader) {
-      return res.status(400).json({
-        ok: false,
-        error: "Missing session",
-        hint: "Send { session: <token or cookie> } along with your video payload",
-      });
-    }
-
-    // remove session keys before forwarding
-    const payload = { ...(req.body || {}) };
-    delete payload.session;
-    delete payload.token;
-    delete payload.flowKey;
-
-    console.log(`[FLOW_GENERATE] -> ${UPSTREAM_VIDEO_GENERATE}`);
-
-    const upstreamRes = await fetchWithTimeout(
-      UPSTREAM_VIDEO_GENERATE,
-      {
-        method: "POST",
-        headers: buildUpstreamHeaders(cookieHeader),
-        body: JSON.stringify(payload),
-      },
-      90000
-    );
-
-    const upstreamBody = await readUpstream(upstreamRes);
-
-    return res.status(upstreamRes.status).json({
-      ok: upstreamRes.ok,
-      status: upstreamRes.status,
-      upstream: UPSTREAM_VIDEO_GENERATE,
-      upstreamBody,
-    });
-  } catch (e) {
-    const msg = e?.name === "AbortError" ? "Upstream timeout (AbortError)" : e?.message || "Generate failed";
-    console.error("[FLOW_GENERATE_ERROR]", e);
-    return res.status(500).json({ ok: false, error: msg, upstream: UPSTREAM_VIDEO_GENERATE });
-  }
-});
-
-module.exports = router;
+export default router;
