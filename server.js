@@ -1,5 +1,5 @@
-// server.js (ESM) - Render + Node 18+
-// MUST use import (repo has "type":"module")
+// server.js (ESM)
+// NOTE: Project uses "type": "module" => must use import, NOT require
 
 import express from "express";
 import cors from "cors";
@@ -7,7 +7,10 @@ import flowRoutes from "./flowRoutes.js";
 
 const app = express();
 
-// --- CORS ---
+// If behind Render/Proxy
+app.set("trust proxy", 1);
+
+// CORS (allow app web / aistudio / local)
 app.use(
   cors({
     origin: "*",
@@ -15,21 +18,25 @@ app.use(
     allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
-app.options("*", cors());
 
-// --- Body parsers ---
-app.use(express.json({ limit: "5mb" }));
+// Body parser
+app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true }));
 
-// --- Health ---
-app.get(["/", "/health"], (req, res) => {
+// Root
+app.get("/", (_req, res) => {
+  res.type("text/plain").send("victorsharp-labs-proxy is running");
+});
+
+// Health
+app.get("/health", (_req, res) => {
   res.json({ ok: true, service: "victorsharp-labs-proxy", ts: Date.now() });
 });
 
-// --- Flow API ---
+// Mount Flow routes
 app.use("/api/flow", flowRoutes);
 
-// --- 404 fallback (JSON) ---
+// 404 JSON
 app.use((req, res) => {
   res.status(404).json({
     ok: false,
@@ -39,8 +46,16 @@ app.use((req, res) => {
   });
 });
 
-// --- Start ---
-const port = process.env.PORT || 10000;
-app.listen(port, () => {
-  console.log(`[FLOW-BACKEND] listening on port ${port}`);
+// Error handler
+app.use((err, _req, res, _next) => {
+  res.status(500).json({
+    ok: false,
+    error: "Server Error",
+    detail: String(err?.message || err),
+  });
+});
+
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => {
+  console.log(`[FLOW-BACKEND] listening on port ${PORT}`);
 });
