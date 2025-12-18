@@ -1,11 +1,13 @@
-// server.js (ESM) — VictorSharp Labs Proxy
+// server.js (ESM) - Render + Node 18+
+// MUST use import (repo has "type":"module")
+
 import express from "express";
 import cors from "cors";
 import flowRoutes from "./flowRoutes.js";
 
 const app = express();
 
-// ---- middlewares
+// --- CORS ---
 app.use(
   cors({
     origin: "*",
@@ -14,22 +16,20 @@ app.use(
   })
 );
 app.options("*", cors());
-app.use(express.json({ limit: "25mb" }));
+
+// --- Body parsers ---
+app.use(express.json({ limit: "5mb" }));
 app.use(express.urlencoded({ extended: true }));
 
-// ---- basic routes
-app.get("/", (_req, res) => {
-  res.type("text/plain").send("victorsharp-labs-proxy is running");
-});
-
-app.get("/health", (_req, res) => {
+// --- Health ---
+app.get(["/", "/health"], (req, res) => {
   res.json({ ok: true, service: "victorsharp-labs-proxy", ts: Date.now() });
 });
 
-// ---- Flow API routes
+// --- Flow API ---
 app.use("/api/flow", flowRoutes);
 
-// ---- 404 handler
+// --- 404 fallback (JSON) ---
 app.use((req, res) => {
   res.status(404).json({
     ok: false,
@@ -39,15 +39,8 @@ app.use((req, res) => {
   });
 });
 
-// ---- crash safety logs
-process.on("unhandledRejection", (err) => {
-  console.error("[UNHANDLED_REJECTION]", err);
-});
-process.on("uncaughtException", (err) => {
-  console.error("[UNCAUGHT_EXCEPTION]", err);
-});
-
-const PORT = Number(process.env.PORT || 10000);
-app.listen(PORT, () => {
-  console.log(`[FLOW-BACKEND] listening on port ${PORT}`);
+// --- Start ---
+const port = process.env.PORT || 10000;
+app.listen(port, () => {
+  console.log(`[FLOW-BACKEND] listening on port ${port}`);
 });
