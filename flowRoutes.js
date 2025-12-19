@@ -4,7 +4,6 @@ const router = express.Router();
 
 /**
  * HÀM TRÍCH XUẤT TOKEN (ya29...)
- * Hỗ trợ bóc tách từ mọi định dạng (Header, Body JSON, String)
  */
 function extractToken(req) {
   const authHeader = req.headers.authorization || req.headers.Authorization || "";
@@ -25,7 +24,7 @@ function extractToken(req) {
 }
 
 /**
- * HÀM GỌI API GOOGLE (Giả lập siêu cấp né 404)
+ * HÀM GỌI API GOOGLE (Giả lập trình duyệt siêu cấp)
  */
 async function callGoogleLabs(url, method, token, payload = null) {
   console.log(`\n📡 [THỬ NGHIỆM] ${method} -> ${url}`);
@@ -48,7 +47,7 @@ async function callGoogleLabs(url, method, token, payload = null) {
     method,
     headers,
     body: (payload && method !== "GET") ? JSON.stringify(payload) : undefined,
-    redirect: "manual" // Ngăn Google tự động đẩy về trang Login (gây ra 404 HTML)
+    redirect: "manual" // Bắt lỗi Redirect để tránh 404 HTML
   };
 
   try {
@@ -84,27 +83,29 @@ router.post("/session/validate", async (req, res) => {
   res.status(result.status).json(result.data || { ok: result.ok });
 });
 
-// ---------- 2. TẠO VIDEO (CƠ CHẾ DÒ TÌM SÂU) ----------
+// ---------- 2. TẠO VIDEO (DÒ TÌM SÂU HƠN) ----------
 router.post("/video/generate", async (req, res) => {
   const token = extractToken(req);
   if (!token) return res.status(400).json({ ok: false, error: "Token hổng có!" });
 
+  // In Log Payload để anh kiểm tra xem App gởi gì đi
+  console.log("📦 Dữ liệu từ App Web gởi qua:", JSON.stringify(req.body, null, 2));
+
   const payload = { ...req.body };
-  // Dọn dẹp các trường không cần thiết cho Google
   delete payload.session;
   delete payload.access_token;
   delete payload.token;
   delete payload.flowSession;
 
-  // DANH SÁCH CÁC ENDPOINT MỚI NHẤT CỦA GOOGLE LABS FX
+  // DANH SÁCH ENDPOINT TỔNG LỰC
   const candidates = [
-    "https://labs.google/fx/api/v1/video/generate",    // Bản v1 mới nhất
-    "https://labs.google/fx/api/v1/tasks/generate",    // Dạng Tasks mới
-    "https://labs.google/fx/api/v1/generate",          // Bản v1 rút gọn
-    "https://labs.google/fx/api/v1/jobs/create",       // Dạng Jobs mới
-    "https://labs.google/fx/api/video/v1/generate",    // v1 nested
-    "https://labs.google/fx/api/video/generate",       // Bản cũ (đang bị 404)
-    "https://labs.google/fx/api/generate"              // Bản gốc
+    "https://labs.google/fx/api/v1/video/generate",    // Mới nhất cho Veo3
+    "https://labs.google/fx/api/v1/tasks",             // Dạng Tasks (Google hay dùng gần đây)
+    "https://labs.google/fx/api/v1/video/tasks",       // Biến thể Tasks
+    "https://labs.google/fx/api/v1/generate",          // Rút gọn v1
+    "https://labs.google/fx/api/video/v1/generate",    // Nested v1
+    "https://labs.google/fx/api/video/generate",       // Cái cũ bị 404
+    "https://labs.google/fx/api/generate"              // Gốc
   ];
 
   let lastResult = null;
@@ -112,22 +113,18 @@ router.post("/video/generate", async (req, res) => {
     const result = await callGoogleLabs(url, "POST", token, payload);
     
     if (result.ok) {
-      console.log(`✅ THÀNH CÔNG! Link hoạt động là: ${url}`);
+      console.log(`✅ THÀNH CÔNG! Đã tìm thấy link: ${url}`);
       return res.json(result.data); 
     }
     lastResult = result;
-    
-    // Nếu token hết hạn (401) thì dừng ngay để anh biết mà thay token
     if (result.status === 401) break; 
   }
 
-  // Nếu thử hết mà vẫn tạch
   res.status(lastResult?.status || 502).json({
     ok: false,
-    error: "Tất cả các Endpoint của Google đều báo lỗi (404/502).",
-    msg: "Vui lòng lấy lại Token ya29 mới nhất và kiểm tra lại Prompt.",
-    lastStatus: lastResult?.status,
-    details: lastResult?.data || "Google trả về HTML (Link bị sai hoặc Token bị logout)."
+    error: "Tất cả Endpoint đều báo lỗi 404 hoặc HTML.",
+    msg: "Có thể Google đã đổi sang link mới hoàn toàn hoặc Payload bị thiếu trường bắt buộc.",
+    details: lastResult?.data || "Google trả về HTML (Redirect về trang chủ)."
   });
 });
 
