@@ -1,32 +1,20 @@
-// server.js
 import express from "express";
 import cors from "cors";
 import flowRoutes from "./flowRoutes.js";
 
 const app = express();
 
-app.use(cors({
-  origin: "*",
-  methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"]
-}));
+// ✅ CORS an toàn cho Render + browser (không bật credentials với origin '*')
+app.use(cors({ origin: "*" }));
 
 app.use(express.json({ limit: "50mb" }));
 
-// Health check
-app.get("/health", (_req, res) => {
-  res.json({ ok: true, service: "victorsharp-flow-proxy" });
-});
+app.get("/", (_req, res) => res.send("victorsharp-labs-proxy is running"));
+app.get("/health", (_req, res) =>
+  res.json({ ok: true, service: "victorsharp-labs-proxy", ts: Date.now() })
+);
 
-// Flow API
 app.use("/api/flow", flowRoutes);
 
-// Fallback
-app.use((_req, res) => {
-  res.status(404).json({ ok: false, error: "API Endpoint Not Found" });
-});
-
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-  console.log(`[FLOW] Server running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`[FLOW] listening on ${PORT}`));
