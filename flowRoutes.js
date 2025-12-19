@@ -3,239 +3,153 @@ import express from "express";
 const router = express.Router();
 
 /**
- * Accepts:
- * - raw token: "ya29...."
- * - JSON string: {"access_token":"ya29..."} or {"session":"ya29..."}
- * - object: {access_token:"ya29..."} or {session:"ya29..."}
+ * HÀM TRÍCH XUẤT TOKEN (ya29...)
+ * Hỗ trợ: Header Authorization, Body JSON, hoặc chuỗi String thuần.
  */
-function extractToken(input) {
-  if (!input) return "";
+function extractToken(req) {
+  // 1. Kiểm tra trong Header Authorization (Cách chuẩn nhất)
+  const authHeader = req.headers.authorization || req.headers.Authorization || "";
+  if (authHeader.toLowerCase().startsWith("bearer ")) {
+    return authHeader.slice(7).trim();
+  }
 
-  // if already string token
-  if (typeof input === "string") {
-    const s = input.trim();
-    if (s.startsWith("ya29.")) return s;
+  // 2. Kiểm tra trong Body
+  const body = req.body || {};
+  let tokenRaw = body.session || body.access_token || body.flowSession || body.token;
 
-    // try parse JSON string
-    if ((s.startsWith("{") && s.endsWith("}")) || (s.startsWith("[") && s.endsWith("]"))) {
-      try {
-        const obj = JSON.parse(s);
-        return extractToken(obj);
-      } catch {
-        return s; // last resort
-      }
+  if (!tokenRaw) {
+    // Nếu cả body là một chuỗi token (plain text)
+    if (typeof req.body === "string" && req.body.startsWith("ya29.")) return req.body.trim();
+    return "";
+  }
+
+  // Nếu token là một object (trường hợp dán nguyên JSON vào app)
+  if (typeof tokenRaw === "object" && tokenRaw !== null) {
+    return tokenRaw.access_token || tokenRaw.session || "";
+  }
+
+  // Nếu là chuỗi JSON string, thử parse nó ra
+  if (typeof tokenRaw === "string" && tokenRaw.startsWith("{")) {
+    try {
+      const parsed = JSON.parse(tokenRaw);
+      return parsed.access_token || parsed.session || tokenRaw;
+    } catch (e) {
+      return tokenRaw;
     }
-    return s;
   }
 
-  // object
-  if (typeof input === "object") {
-    return (
-      (input.access_token || input.session || input.token || input.bearer || "").toString().trim()
-    );
-  }
-
-  return "";
+  return tokenRaw.toString().trim();
 }
 
-function getBearerFromReq(req) {
-  const h = req.headers.authorization || req.headers.Authorization || "";
-  if (typeof h === "string" && h.toLowerCase().startsWith("bearer ")) {
-    return h.slice(7).trim();
-  }
-  return "";
-}
+/**
+ * HÀM GỌI API GOOGLE (Helper)
+ * Chuyên trị việc bắt tay với Google Labs và log lỗi 502
+ */
+async function callGoogleLabs(url, method, token, payload = null) {
+  console.log(`\n📡 [FORWARD] ${method} -> ${url}`);
+  
+  const headers = {
+    "Authorization": `Bearer ${token}`,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+    "User-Agent": "VictorSharp-Flow-Proxy/2.0"
+  };
 
-async function fetchJson(url, { method = "GET", headers = {}, body } = {}) {
-  const res = await fetch(url, {
+  const options = {
     method,
     headers,
-    body: body ? JSON.stringify(body) : undefined,
-  });
-
-  const text = await res.text();
-  let json = null;
-
-  try {
-    json = JSON.parse(text);
-  } catch {
-    json = null;
-  }
-
-  return { ok: res.ok, status: res.status, text, json };
-}
-
-function flowHeaders(token) {
-  return {
-    Authorization: `Bearer ${token}`,
-    "Content-Type": "application/json",
-    Accept: "application/json",
-    // Helps avoid some edge cases
-    "User-Agent": "victorsharp-labs-proxy/1.0",
+    body: (payload && method !== "GET") ? JSON.stringify(payload) : undefined
   };
+
+  try {
+    const response = await fetch(url, options);
+    const text = await response.text();
+    let json = null;
+    
+    try { json = JSON.parse(text); } catch (e) {}
+
+    console.log(`📥 [RESPONSE] Status: ${response.status}`);
+    
+    // Nếu Google trả về HTML (Lỗi redirect/Link sai)
+    const isHtml = text.trim().startsWith("<!DOCTYPE html") || text.includes("<html");
+    if (isHtml) {
+        console.error("❌ LỖI: Google trả về trang HTML thay vì JSON. Kiểm tra lại URL API.");
+        return { ok: false, status: 502, error: "Google Labs trả về trang HTML (sai Endpoint)." };
+    }
+
+    return { ok: response.ok, status: response.status, data: json, raw: text };
+  } catch (err) {
+    console.error("🔥 [NETWORK_ERROR]:", err.message);
+    return { ok: false, status: 504, error: "Hổng kết nối được tới Google Labs (Timeout)." };
+  }
 }
 
-// ---------- HEALTH CHECK ----------
-router.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now() }));
-
-// ---------- VALIDATE FLOW SESSION ----------
+// ---------- 1. KIỂM TRA SESSION (VALIDATE) ----------
+// App Web gọi: POST /api/flow/session/validate
 router.post("/session/validate", async (req, res) => {
-  try {
-    const token =
-      extractToken(req.body?.session) ||
-      extractToken(req.body?.access_token) ||
-      extractToken(req.body) ||
-      getBearerFromReq(req);
+  const token = extractToken(req);
+  if (!token) return res.status(400).json({ ok: false, error: "Thiếu Token ya29 rồi đại ca!" });
 
-    if (!token) {
-      return res.status(400).json({
-        ok: false,
-        error: "Missing Flow token. Paste only ya29.... (or JSON containing access_token).",
-      });
-    }
-
-    // Validate endpoint (works for your flow session link)
-    const upstream = "https://labs.google/fx/api/auth/session";
-
-    const r = await fetchJson(upstream, {
-      method: "GET",
-      headers: flowHeaders(token),
-    });
-
-    if (!r.ok) {
-      return res.status(400).json({
-        ok: false,
-        error: "Validate failed",
-        upstream,
-        upstreamStatus: r.status,
-        upstreamBody: r.json || r.text,
-      });
-    }
-
-    return res.json({
-      ok: true,
-      valid: true,
-      upstream,
-      // return small info only
-      expires: r.json?.expires,
-      user: r.json?.user ? { name: r.json.user.name, email: r.json.user.email } : undefined,
-    });
-  } catch (e) {
-    console.error("[FLOW_VALIDATE_ERROR]", e);
-    return res.status(500).json({ ok: false, error: e?.message || "Validate error" });
+  const result = await callGoogleLabs("https://labs.google/fx/api/auth/session", "GET", token);
+  
+  if (result.ok) {
+    return res.json({ ok: true, valid: true, data: result.data });
   }
+  res.status(result.status).json({ 
+    ok: false, 
+    error: "Token hết hạn hoặc không có quyền!", 
+    details: result.data || "Unauthorized" 
+  });
 });
 
-// ---------- CREATE VIDEO (FLOW) ----------
+// ---------- 2. TẠO VIDEO (GENERATE) ----------
+// App Web gọi: POST /api/flow/video/generate
 router.post("/video/generate", async (req, res) => {
-  try {
-    const token =
-      extractToken(req.body?.session) ||
-      extractToken(req.body?.access_token) ||
-      extractToken(req.body?.flowSession) ||
-      getBearerFromReq(req);
+  const token = extractToken(req);
+  if (!token) return res.status(400).json({ ok: false, error: "Hổng có Token, sao em tạo video được!" });
 
-    if (!token) {
-      return res.status(400).json({ ok: false, error: "Missing Flow token (ya29...)." });
-    }
+  // Dọn dẹp payload: Chỉ giữ lại những gì Google cần
+  const cleanBody = { ...req.body };
+  delete cleanBody.session;
+  delete cleanBody.access_token;
+  delete cleanBody.flowSession;
+  delete cleanBody.token;
 
-    // Payload from app (keep as-is)
-    const payload = req.body || {};
+  // Endpoint tạo Video của Flow
+  const url = "https://labs.google/fx/api/video/generate";
+  const result = await callGoogleLabs(url, "POST", token, cleanBody);
 
-    // Flow endpoints have changed a few times. Try best candidates in order.
-    const candidates = [
-      "https://labs.google/fx/api/video/generate",
-      "https://labs.google/fx/fx/api/video/generate", // fallback (rare)
-    ];
-
-    let last = null;
-
-    for (const upstream of candidates) {
-      const r = await fetchJson(upstream, {
-        method: "POST",
-        headers: flowHeaders(token),
-        body: payload,
-      });
-
-      last = { upstream, ...r };
-
-      // If HTML returned => wrong endpoint, try next
-      const looksLikeHtml =
-        typeof r.text === "string" &&
-        (r.text.trim().startsWith("<!DOCTYPE html") || r.text.includes("<html"));
-
-      if (r.ok && !looksLikeHtml) {
-        return res.json({
-          ok: true,
-          upstream,
-          data: r.json ?? r.text,
-        });
-      }
-    }
-
-    // Failed all
-    return res.status(502).json({
-      ok: false,
-      error: "Create job failed",
-      upstream: last?.upstream,
-      upstreamStatus: last?.status,
-      upstreamBody: last?.json || last?.text,
-    });
-  } catch (e) {
-    console.error("[FLOW_GENERATE_ERROR]", e);
-    return res.status(500).json({ ok: false, error: e?.message || "Generate error" });
+  if (result.ok) {
+    return res.json({ ok: true, data: result.data });
   }
+
+  // Nếu tạch, trả về chi tiết để anh coi Log trên Render là biết tại sao liền
+  res.status(result.status || 502).json({
+    ok: false,
+    error: "Tạo Job Video thất bại (502)",
+    upstreamStatus: result.status,
+    upstreamBody: result.data || "Google từ chối yêu cầu (Kiểm tra Payload hoặc Token)."
+  });
 });
 
-// ---------- OPTIONAL: VIDEO STATUS/POLL ----------
+// ---------- 3. KIỂM TRA TRẠNG THÁI (STATUS) ----------
+// App Web gọi: POST /api/flow/video/status
 router.post("/video/status", async (req, res) => {
-  try {
-    const token =
-      extractToken(req.body?.session) ||
-      extractToken(req.body?.access_token) ||
-      extractToken(req.body?.flowSession) ||
-      getBearerFromReq(req);
+    const token = extractToken(req);
+    // Lấy jobId từ body hoặc query
+    const jobId = req.body?.jobId || req.body?.id || req.query?.jobId;
 
-    const jobId = req.body?.jobId || req.body?.id || req.query?.jobId || req.query?.id;
-
-    if (!token) return res.status(400).json({ ok: false, error: "Missing Flow token (ya29...)." });
-    if (!jobId) return res.status(400).json({ ok: false, error: "Missing jobId." });
-
-    const candidates = [
-      `https://labs.google/fx/api/video/status?jobId=${encodeURIComponent(jobId)}`,
-      `https://labs.google/fx/api/video/status?id=${encodeURIComponent(jobId)}`,
-    ];
-
-    let last = null;
-
-    for (const upstream of candidates) {
-      const r = await fetchJson(upstream, {
-        method: "GET",
-        headers: flowHeaders(token),
-      });
-
-      last = { upstream, ...r };
-
-      const looksLikeHtml =
-        typeof r.text === "string" &&
-        (r.text.trim().startsWith("<!DOCTYPE html") || r.text.includes("<html"));
-
-      if (r.ok && !looksLikeHtml) {
-        return res.json({ ok: true, upstream, data: r.json ?? r.text });
-      }
+    if (!token || !jobId) {
+        return res.status(400).json({ ok: false, error: "Thiếu Job ID hoặc Token rồi!" });
     }
 
-    return res.status(502).json({
-      ok: false,
-      error: "Status check failed",
-      upstream: last?.upstream,
-      upstreamStatus: last?.status,
-      upstreamBody: last?.json || last?.text,
-    });
-  } catch (e) {
-    console.error("[FLOW_STATUS_ERROR]", e);
-    return res.status(500).json({ ok: false, error: e?.message || "Status error" });
-  }
+    const url = `https://labs.google/fx/api/video/status?jobId=${encodeURIComponent(jobId)}`;
+    const result = await callGoogleLabs(url, "GET", token);
+
+    if (result.ok) {
+        return res.json({ ok: true, data: result.data });
+    }
+    res.status(result.status).json({ ok: false, error: "Lỗi lấy trạng thái video", details: result.data });
 });
 
 export default router;
