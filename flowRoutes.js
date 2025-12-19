@@ -4,7 +4,6 @@ const router = express.Router();
 
 /**
  * HÀM TRÍCH XUẤT TOKEN (ya29...)
- * Hỗ trợ bóc tách từ Header Authorization hoặc Body (JSON/String)
  */
 function extractToken(req) {
   const authHeader = req.headers.authorization || req.headers.Authorization || "";
@@ -25,19 +24,26 @@ function extractToken(req) {
 }
 
 /**
- * HÀM GỌI API GOOGLE (Helper)
- * Tự động thử nghiệm và bắt lỗi 404/502
+ * HÀM GỌI API GOOGLE (Nâng cấp giả lập trình duyệt)
  */
 async function callGoogleLabs(url, method, token, payload = null) {
   console.log(`\n📡 [GỬI ĐI] ${method} -> ${url}`);
   
+  // LOG PAYLOAD KEYS ĐỂ DEBUG (Không in giá trị nhạy cảm)
+  if (payload) {
+    console.log(`📦 Payload Keys: [${Object.keys(payload).join(", ")}]`);
+  }
+
   const options = {
     method,
     headers: {
       "Authorization": `Bearer ${token}`,
       "Content-Type": "application/json",
       "Accept": "application/json",
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) FlowProxy/V5"
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      "Origin": "https://labs.google",
+      "Referer": "https://labs.google/fx/video",
+      "X-Requested-With": "XMLHttpRequest"
     },
     body: (payload && method !== "GET") ? JSON.stringify(payload) : undefined
   };
@@ -51,14 +57,24 @@ async function callGoogleLabs(url, method, token, payload = null) {
     console.log(`📥 [PHẢN HỒI] Status: ${response.status}`);
     const isHtml = text.trim().startsWith("<!DOCTYPE html") || text.includes("<html");
 
-    return { ok: response.ok && !isHtml, status: response.status, data: json, raw: text, isHtml };
+    if (isHtml) {
+        console.warn(`⚠️ Cảnh báo: Google trả về trang HTML tại ${url}. Đang thử link khác...`);
+    }
+
+    return { 
+      ok: response.ok && !isHtml, 
+      status: response.status, 
+      data: json, 
+      raw: text, 
+      isHtml 
+    };
   } catch (err) {
     console.error("🔥 [LỖI KẾT NỐI]:", err.message);
     return { ok: false, status: 504, error: err.message };
   }
 }
 
-// ---------- 1. KIỂM TRA SESSION (Dùng cho nút Check Auth) ----------
+// ---------- 1. KIỂM TRA SESSION ----------
 router.post("/session/validate", async (req, res) => {
   const token = extractToken(req);
   if (!token) return res.status(400).json({ ok: false, error: "Thiếu Token ya29!" });
@@ -67,42 +83,47 @@ router.post("/session/validate", async (req, res) => {
   res.status(result.status).json(result.data || { ok: result.ok });
 });
 
-// ---------- 2. TẠO VIDEO (Nơi anh đang bị 404) ----------
+// ---------- 2. TẠO VIDEO (Cơ chế Dò tìm Tự động) ----------
 router.post("/video/generate", async (req, res) => {
   const token = extractToken(req);
-  if (!token) return res.status(400).json({ ok: false, error: "Token hổng có, sao tạo video nè!" });
+  if (!token) return res.status(400).json({ ok: false, error: "Token hổng có!" });
 
   const payload = { ...req.body };
+  // Dọn dẹp payload để Google hổng "chê"
   delete payload.session;
   delete payload.access_token;
+  delete payload.token;
 
-  // Danh sách các link Google có khả năng chạy (Tự động dò link đúng)
+  // DANH SÁCH ENDPOINT CẬP NHẬT MỚI NHẤT
   const candidates = [
-    "https://labs.google/fx/api/v1/video/generate", // Phương án v1 mới nhất
-    "https://labs.google/fx/api/generate",          // Phương án rút gọn
-    "https://labs.google/fx/api/video/generate"     // Link cũ (cái anh bị 404)
+    "https://labs.google/fx/api/v1/video/generate", 
+    "https://labs.google/fx/api/v1/generate",
+    "https://labs.google/fx/api/video/generate", 
+    "https://labs.google/fx/api/generate"
   ];
 
   let lastResult = null;
   for (const url of candidates) {
     const result = await callGoogleLabs(url, "POST", token, payload);
+    
     if (result.ok) {
-      console.log(`✅ TRÚNG RỒI! Đã tạo thành công tại: ${url}`);
+      console.log(`✅ THÀNH CÔNG! Link chuẩn là: ${url}`);
       return res.json(result.data); 
     }
     lastResult = result;
-    if (result.status === 401) break; // Token sai thì khỏi thử link khác
+    
+    // Nếu lỗi 401 (Hết hạn token) thì dừng luôn cho đỡ tốn tài nguyên
+    if (result.status === 401) break; 
   }
 
   res.status(lastResult?.status || 502).json({
     ok: false,
-    error: "Google từ chối hoặc link đã đổi (404/502).",
-    details: lastResult?.data || "Coi log trên Render nhen anh!"
+    error: "Tất cả các đường link của Google đều báo lỗi (404/502).",
+    details: lastResult?.data || "Vui lòng xem log trên Render để biết Google chê cái gì nhen!"
   });
 });
 
 // ---------- 3. KIỂM TRA TRẠNG THÁI (STATUS) ----------
-// Khớp với App Web gọi GET /api/flow/video/status/ID_CUA_ANH
 router.get("/video/status/:jobId", async (req, res) => {
     const token = extractToken(req);
     const jobId = req.params.jobId;
@@ -111,7 +132,7 @@ router.get("/video/status/:jobId", async (req, res) => {
 
     const statusUrls = [
         `https://labs.google/fx/api/v1/video/status?jobId=${encodeURIComponent(jobId)}`,
-        `https://labs.google/fx/api/status?jobId=${encodeURIComponent(jobId)}`,
+        `https://labs.google/fx/api/v1/status?jobId=${encodeURIComponent(jobId)}`,
         `https://labs.google/fx/api/video/status?jobId=${encodeURIComponent(jobId)}`
     ];
 
@@ -122,12 +143,12 @@ router.get("/video/status/:jobId", async (req, res) => {
     res.status(502).json({ ok: false, error: "Hổng lấy được trạng thái video." });
 });
 
-// Dự phòng cho trường hợp app cũ gọi POST
+// Dự phòng POST
 router.post("/video/status", async (req, res) => {
     const token = extractToken(req);
     const jobId = req.body?.jobId || req.body?.id || req.query?.jobId;
     if (!jobId) return res.status(400).json({ ok: false, error: "Missing JobId" });
-    res.redirect(307, `/api/flow/video/status/${jobId}`);
+    res.redirect(307, `./status/${jobId}`);
 });
 
 export default router;
