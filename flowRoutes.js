@@ -24,7 +24,7 @@ function extractToken(req) {
 }
 
 /**
- * HÀM GỌI API GOOGLE (Giả lập trình duyệt siêu cấp)
+ * HÀM GỌI API GOOGLE (Giả lập siêu cấp)
  */
 async function callGoogleLabs(url, method, token, payload = null) {
   console.log(`\n📡 [THỬ NGHIỆM] ${method} -> ${url}`);
@@ -47,7 +47,7 @@ async function callGoogleLabs(url, method, token, payload = null) {
     method,
     headers,
     body: (payload && method !== "GET") ? JSON.stringify(payload) : undefined,
-    redirect: "manual" // Bắt lỗi Redirect để tránh 404 HTML
+    redirect: "manual" 
   };
 
   try {
@@ -58,7 +58,6 @@ async function callGoogleLabs(url, method, token, payload = null) {
 
     console.log(`📥 [KẾT QUẢ] Status: ${response.status}`);
     
-    // Nếu là trang HTML hoặc bị Redirect thì link này không đúng
     const isRedirect = response.status === 302 || response.status === 301;
     const isHtml = text.trim().startsWith("<!DOCTYPE html") || text.includes("<html");
 
@@ -88,7 +87,7 @@ router.post("/video/generate", async (req, res) => {
   const token = extractToken(req);
   if (!token) return res.status(400).json({ ok: false, error: "Token hổng có!" });
 
-  // In Log Payload để anh kiểm tra xem App gởi gì đi
+  // In Log Payload để mình soi xem App Web đang gởi gì qua
   console.log("📦 Dữ liệu từ App Web gởi qua:", JSON.stringify(req.body, null, 2));
 
   const payload = { ...req.body };
@@ -97,14 +96,15 @@ router.post("/video/generate", async (req, res) => {
   delete payload.token;
   delete payload.flowSession;
 
-  // DANH SÁCH ENDPOINT TỔNG LỰC
+  // DANH SÁCH ENDPOINT TỔNG LỰC (Google v1/v1beta)
   const candidates = [
-    "https://labs.google/fx/api/v1/video/generate",    // Mới nhất cho Veo3
-    "https://labs.google/fx/api/v1/tasks",             // Dạng Tasks (Google hay dùng gần đây)
-    "https://labs.google/fx/api/v1/video/tasks",       // Biến thể Tasks
-    "https://labs.google/fx/api/v1/generate",          // Rút gọn v1
-    "https://labs.google/fx/api/video/v1/generate",    // Nested v1
-    "https://labs.google/fx/api/video/generate",       // Cái cũ bị 404
+    "https://labs.google/fx/api/v1/video/generate",    // Bản chuẩn v1
+    "https://labs.google/fx/api/v1/video:generate",   // Bản dùng dấu hai chấm (Google Style)
+    "https://labs.google/fx/api/v1/generate",          // Bản rút gọn
+    "https://labs.google/fx/api/v1/tasks",             // Bản chạy theo Task vụ
+    "https://labs.google/fx/api/v1/video/tasks",       // Biến thể Task video
+    "https://labs.google/fx/api/v1beta/video/generate",// Bản beta
+    "https://labs.google/fx/api/video/generate",       // Cái cũ (anh đang bị 404)
     "https://labs.google/fx/api/generate"              // Gốc
   ];
 
@@ -113,7 +113,7 @@ router.post("/video/generate", async (req, res) => {
     const result = await callGoogleLabs(url, "POST", token, payload);
     
     if (result.ok) {
-      console.log(`✅ THÀNH CÔNG! Đã tìm thấy link: ${url}`);
+      console.log(`✅ THÀNH CÔNG! Đã tìm thấy link hoạt động: ${url}`);
       return res.json(result.data); 
     }
     lastResult = result;
@@ -122,9 +122,9 @@ router.post("/video/generate", async (req, res) => {
 
   res.status(lastResult?.status || 502).json({
     ok: false,
-    error: "Tất cả Endpoint đều báo lỗi 404 hoặc HTML.",
-    msg: "Có thể Google đã đổi sang link mới hoàn toàn hoặc Payload bị thiếu trường bắt buộc.",
-    details: lastResult?.data || "Google trả về HTML (Redirect về trang chủ)."
+    error: "Tất cả Endpoint đều báo lỗi 404.",
+    msg: "Google đã dời link API hoặc chặn Render. Anh coi log Render gởi em nhen!",
+    details: lastResult?.data || "Google trả về HTML (Redirect)."
   });
 });
 
@@ -138,6 +138,7 @@ router.get("/video/status/:jobId", async (req, res) => {
         `https://labs.google/fx/api/v1/video/status?jobId=${encodeURIComponent(jobId)}`,
         `https://labs.google/fx/api/v1/status?jobId=${encodeURIComponent(jobId)}`,
         `https://labs.google/fx/api/v1/tasks/${encodeURIComponent(jobId)}`,
+        `https://labs.google/fx/api/v1/video/tasks/${encodeURIComponent(jobId)}`,
         `https://labs.google/fx/api/video/status?jobId=${encodeURIComponent(jobId)}`
     ];
 
