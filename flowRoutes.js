@@ -3,7 +3,7 @@ import express from "express";
 const router = express.Router();
 
 /**
- * HÀM TRÍCH XUẤT TOKEN (ya29...)
+ * HÀM RÚT TOKEN (ya29...)
  */
 function extractToken(req) {
   const authHeader = req.headers.authorization || req.headers.Authorization || "";
@@ -24,11 +24,11 @@ function extractToken(req) {
 }
 
 /**
- * HÀM GỌI API GOOGLE (Stealth Mode V6)
- * Giả lập siêu sâu để né 404 Redirect
+ * HÀM GỌI API GOOGLE (Stealth Mode V7)
+ * Cố gắng giả lập trình duyệt và bắt lỗi redirect 404
  */
 async function callGoogleLabs(url, method, token, payload = null) {
-  console.log(`\n📡 [THỬ NGHIỆM] ${method} -> ${url}`);
+  console.log(`\n📡 [DÒ ĐƯỜNG] ${method} -> ${url}`);
   
   const headers = {
     "Authorization": `Bearer ${token}`,
@@ -48,7 +48,7 @@ async function callGoogleLabs(url, method, token, payload = null) {
     method,
     headers,
     body: (payload && method !== "GET") ? JSON.stringify(payload) : undefined,
-    redirect: "manual" // Để mình bắt được lệnh 302 của Google
+    redirect: "manual" 
   };
 
   try {
@@ -57,8 +57,7 @@ async function callGoogleLabs(url, method, token, payload = null) {
     const location = response.headers.get("location");
     
     console.log(`📥 [KẾT QUẢ] Status: ${response.status}`);
-    if (location) console.log(`🔗 Redirect tới: ${location}`);
-
+    
     const isRedirect = response.status === 302 || response.status === 301;
     const isHtml = text.trim().startsWith("<!DOCTYPE html") || text.includes("<html");
 
@@ -79,7 +78,7 @@ async function callGoogleLabs(url, method, token, payload = null) {
   }
 }
 
-// 1. KIỂM TRA SESSION
+// 1. KIỂM TRA SESSION (CHECK AUTH)
 router.post("/session/validate", async (req, res) => {
   const token = extractToken(req);
   if (!token) return res.status(400).json({ ok: false, error: "Thiếu Token!" });
@@ -87,7 +86,7 @@ router.post("/session/validate", async (req, res) => {
   res.status(result.status).json(result.data || { ok: result.ok, redirect: result.redirectUrl });
 });
 
-// 2. TẠO VIDEO (DÒ TÌM ĐA ĐIỂM)
+// 2. TẠO VIDEO (DÒ TÌM ENDPOINT TOÀN DIỆN)
 router.post("/video/generate", async (req, res) => {
   const token = extractToken(req);
   if (!token) return res.status(400).json({ ok: false, error: "Token hổng có!" });
@@ -96,25 +95,35 @@ router.post("/video/generate", async (req, res) => {
   delete payload.session;
   delete payload.access_token;
 
+  // DANH SÁCH 8 ENDPOINT TIỀM NĂNG NHẤT HIỆN TẠI
   const candidates = [
-    "https://labs.google/fx/api/v1/video:generate",
-    "https://labs.google/fx/api/v1/video/generate",
-    "https://labs.google/fx/api/video/generate"
+    "https://labs.google/fx/api/v1/video:generate",     // Bản v1 kiểu dấu hai chấm (Mới nhất)
+    "https://labs.google/fx/api/v1/tasks:generate",    // Bản chạy theo Task
+    "https://labs.google/fx/api/v1/jobs:generate",     // Bản chạy theo Job
+    "https://labs.google/fx/api/v1/video/generate",    // Bản v1 gạch chéo
+    "https://labs.google/fx/api/v1/generate",          // Bản rút gọn
+    "https://labs.google/fx/api/v1/projects/default/video:generate", // Bản Project ngầm
+    "https://labs.google/fx/api/video/generate",       // Bản cũ (anh bị 404)
+    "https://labs.google/fx/api/generate"              // Bản gốc
   ];
 
   let lastResult = null;
   for (const url of candidates) {
     const result = await callGoogleLabs(url, "POST", token, payload);
-    if (result.ok) return res.json(result.data);
+    if (result.ok) {
+      console.log(`✅ THÀNH CÔNG! Đã tìm thấy link hoạt động: ${url}`);
+      return res.json(result.data); 
+    }
     lastResult = result;
-    if (result.status === 401) break;
+    if (result.status === 401) break; 
   }
 
+  // Báo lỗi chi tiết kèm nội dung HTML để anh nhìn thấy Google đuổi anh đi đâu
   res.status(lastResult?.status || 502).json({
     ok: false,
-    error: "Tất cả link đều báo 404 (Google chặn Render).",
-    redirected_to: lastResult?.redirectUrl,
-    status: lastResult?.status
+    error: "Google chặn Render (404/302).",
+    google_says: lastResult?.isHtml ? lastResult.raw.slice(0, 500) : "Check log Render!",
+    redirect: lastResult?.redirectUrl
   });
 });
 
